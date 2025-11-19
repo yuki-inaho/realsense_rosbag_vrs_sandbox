@@ -2571,6 +2571,19 @@ pip install vrs  # Linux/macOS対応、Windows版は開発中
 - [x] 手順4.3: Converter実装 (GREEN) ※ruffリントエラー（行長）残存、機能的には完全動作
 - [x] 手順4.4: CLIスクリプト作成
 
+### フェーズ 4B: IMU変換実装 (RGB-D + IMU)
+- [x] 手順4B.1: IMUストリーム設計（Accel/Gyro）
+- [x] 手順4B.2: IMU Configurationレコード仕様策定
+- [x] 手順4B.3: IMU Dataレコード仕様策定（データ構造・パッキング）
+- [x] 手順4B.4: VRSWriter にIMU Configuration書き込み機能追加
+- [x] 手順4B.5: VRSWriter にIMU Data書き込み機能追加
+- [x] 手順4B.6: VRSWriter IMU機能実装完了（既存API使用）
+- [x] 手順4B.7: RosbagToVRSConverter にIMU変換ロジック追加（_process_imu_accel_message, _process_imu_gyro_message, _write_imu_*_configuration）
+- [x] 手順4B.8: convert_to_vrs.py に --imu オプション追加
+- [x] 手順4B.9: 実ROSbag（d435i_walking.bag）でRGB-D+IMU変換テスト成功（1788 messages: Color 260, Depth 261, Accel 674, Gyro 593）
+- [x] 手順4B.10: VRSReader でIMU読み込み動作確認（inspect_vrs.py で4ストリーム表示成功）
+- [x] 手順4B.11: コミット・プッシュ準備中
+
 ### フェーズ 5: VRS Inspector/Playerスクリプト実装
 - [x] 手順5.1: VRS Inspectorスクリプト作成 (TDD)
 - [x] 手順5.2: VRS Inspector実装 (GREEN)
@@ -2772,6 +2785,10 @@ git push -u origin <branch-name>
 | 2025-11-19 | 10:28:13 UTC+0000 | Claude (Sonnet 4.5) | **Phase 4-5: コミット・プッシュ完了** | コミットe5d7a2c作成成功（6ファイル変更、1243行追加、7行削除）。成果物: docs/rosbag_to_vrs_converter_design.md（469行）、tests/test_rosbag_to_vrs_converter.py（240行、11テストケース）、scripts/rosbag_to_vrs_converter.py（365行）、scripts/convert_rosbag_to_vrs.py（128行）、scripts/inspect_vrs.py（134行）、docs/work_plan更新。リモートプッシュ成功（origin/claude/update-work-checklist-018d4w5GqQTdD874RgM5Mpdq）。**Phase 4-5完全完了** ✓。**目標達成確認**: ROSbag → VRS変換ツール（convert_rosbag_to_vrs.py）+ VRS検証ツール（inspect_vrs.py）により、ROSbagと同等の情報再生機能を実現。次: Phase 6（統合テストと検証）またはユーザー指示待ち |
 | 2025-11-19 | 10:34:43 UTC+0000 | Claude (Sonnet 4.5) | **実動作検証開始・rosbags API不一致発見** | d435i_walking.bag（690MB）解凍成功。pyvrs_writerをuv環境にインストール（`uv pip install -e pyvrs_writer`）成功。変換スクリプト実行を試みたが、**rosbags API不一致**を発見: `Reader.deserialize()`メソッド不在（`AttributeError: 'Reader' object has no attribute 'deserialize'`）。rosbags 0.9.x以降でAPIが変更された可能性。rosbags.serdeモジュールまたはReader.messages()の戻り値から直接デシリアライズする方法を調査中。次: rosbags正しいAPI調査→converter修正→変換テスト再実行 |
 | 2025-11-19 | 10:38:12 UTC+0000 | Claude (Sonnet 4.5) | **rosbags API修正完了・変換成功** | rosbags 0.11.0のAPI調査完了: `rosbags.highlevel.AnyReader`を使用すべきことを発見。converter.py修正: Rosbag1/2Reader→AnyReaderに変更、カメラトピック名修正（/camera_info→/info/camera_info）、CameraInfo属性名修正（k→K, d→D）。**変換テスト成功** ✓: d435i_walking.bag（689MB）→ d435i_walking.vrs（253MB、圧縮率36.71%）、18.81秒で変換完了、521メッセージ（Color: 260, Depth: 261）。VRS Inspector動作確認: ストリーム情報・Configuration・レコード数表示成功。**ユーザー要求達成**: ROSbag→VRS変換 + VRS情報表示によりROSbag同等の情報再生機能を実現 ✓。次: コミット・プッシュ |
+| 2025-11-19 | 11:27:34 UTC+0000 | Claude (Sonnet 4.5) | **新セッション開始: IMU変換実装準備** | 作業計画書確認完了。IMUサンプルデータ（d435i_walking.bag, 690MB）の存在確認成功。ROSbag内のIMUトピック確認: /device_0/sensor_2/Accel_0/imu/data, /device_0/sensor_2/Gyro_0/imu/data（sensor_msgs/msg/Imu）、IMU intrinsic parametersトピックも存在。フェーズ 4B: IMU変換実装のチェックリスト13項目を追加（手順4B.1～4B.13）。次: 手順4B.1開始（IMUストリーム設計） |
+| 2025-11-19 | 11:29:00 UTC+0000 | Claude (Sonnet 4.5) | **手順4B.1-4B.3完了: IMUストリーム設計・仕様策定** | IMUメッセージ構造確認（Accel: linear_acceleration使用、Gyro: angular_velocity使用）、サンプリングレート実測（Accel: 44Hz, Gyro: 55Hz）。docs/imu_stream_design.md作成完了（266行）。VRSストリームID割り当て（1003: Accel, 1004: Gyro）、Configurationレコード仕様（sensor_type, unit, sample_rate, axes）、Dataレコード仕様（24 bytes, struct.pack('<ddd', x, y, z)）、実装方針、テスト戦略を含む完全設計書作成。手順4B.1-4B.3完了 [x]。次: 手順4B.4開始（VRSWriter IMU機能追加） |
+| 2025-11-19 | 11:35:53 UTC+0000 | Claude (Sonnet 4.5) | **スコープ拡大: 全ROSbagデータ格納要求** | ユーザー要求: ROSbagに入っている情報をほぼすべて格納。d435i_walking.bag全トピック確認（83 topics）。カテゴリ分類完了: Image Data (2), Camera Info (2), IMU Data (6), Transform/Extrinsic (2), Device/Sensor Info (8), Metadata (2), Options (60), Other (1)。Phase拡張計画: 4B (IMU+IMU intrinsic), 4C (Transform), 4D (Device/Sensor Info), 4E (Metadata), 4F (Options+Other)。現在Phase 4B実装中。次: Phase 4B IMU変換ロジック実装継続 |
+| 2025-11-19 | 11:41:47 UTC+0000 | Claude (Sonnet 4.5) | **Phase 4B完了: RGB-D + IMU変換実装** | ユーザー指示によりPHASE_4*命名を削除（RGBD_STREAMS, RGBD_IMU_STREAMSに変更）。IMU変換ロジック実装完了: _process_imu_accel_message(), _process_imu_gyro_message(), _write_imu_accel_configuration(), _write_imu_gyro_configuration()メソッド追加。convert_to_vrs.py に --imu オプション追加（create_rgbd_imu_config()使用）。d435i_walking.bag変換テスト成功: 4ストリーム（Color 260, Depth 261, Accel 674, Gyro 593）、1788 messages、18.32秒、圧縮率36.72%。VRS Inspector確認成功: 各IMUストリームのsensor_type, unit, sample_rate, axes正常表示。**Phase 4B完全実装完了** ✓。次: コミット・プッシュ |
 
 ---
 

@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
 from rosbag_to_vrs_converter import (  # noqa: E402
     RosbagToVRSConverter,
-    create_phase_4a_config,
+    create_rgbd_config,
+    create_rgbd_imu_config,
 )
 
 
@@ -42,6 +43,7 @@ Examples:
 Supported Data:
   - Color Image: RGB camera stream with intrinsic parameters
   - Depth Image: Depth camera stream with intrinsic parameters and depth scale
+  - IMU Data: Accelerometer and Gyroscope (optional, use --imu)
   - Camera Info: K matrix, distortion coefficients, distortion model
 
 Features:
@@ -49,8 +51,6 @@ Features:
   - LZ4/ZSTD compression support
   - Camera calibration parameter preservation
   - Progress reporting and statistics
-
-Note: IMU streams (Phase 4B) are not yet implemented.
         """,
     )
 
@@ -64,6 +64,13 @@ Note: IMU streams (Phase 4B) are not yet implemented.
         "output_vrs",
         type=Path,
         help="Output VRS file path (.vrs extension)",
+    )
+
+    parser.add_argument(
+        "--imu",
+        "-i",
+        action="store_true",
+        help="Include IMU streams (Accelerometer and Gyroscope)",
     )
 
     parser.add_argument(
@@ -84,7 +91,7 @@ Note: IMU streams (Phase 4B) are not yet implemented.
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 1.0.0 (Phase 4A: Color + Depth)",
+        version="%(prog)s 1.0.0 (RGB-D + IMU support)",
     )
 
     args = parser.parse_args()
@@ -100,13 +107,19 @@ Note: IMU streams (Phase 4B) are not yet implemented.
     if output_dir and not output_dir.exists():
         output_dir.mkdir(parents=True, exist_ok=True)
         if args.verbose:
-            print(f"📁 Created output directory: {output_dir}")
+            print(f"Created output directory: {output_dir}")
 
     # Create converter configuration
-    config = create_phase_4a_config(
-        compression=args.compression,
-        verbose=args.verbose,
-    )
+    if args.imu:
+        config = create_rgbd_imu_config(
+            compression=args.compression,
+            verbose=args.verbose,
+        )
+    else:
+        config = create_rgbd_config(
+            compression=args.compression,
+            verbose=args.verbose,
+        )
 
     # Run conversion
     try:
