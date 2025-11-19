@@ -107,7 +107,8 @@ apt-get install -y \
   libpng-dev \
   libeigen3-dev \
   libgtest-dev \
-  googletest
+  googletest \
+  pybind11-dev
 ```
 
 Build VRS library locally:

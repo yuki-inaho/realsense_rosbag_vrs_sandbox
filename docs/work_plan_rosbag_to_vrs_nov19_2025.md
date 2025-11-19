@@ -2539,7 +2539,7 @@ pip install vrs  # Linux/macOS対応、Windows版は開発中
 - [x] 手順1A.1: VRS C++ライブラリをgit submoduleとして追加 (third/vrs) ※設計変更により実施
 - [x] 手順1A.2: システム依存関係の確認とインストール
 - [x] 手順1A.3: pyvrs_writerディレクトリ構造の作成
-- [ ] 手順1A.4: CMakeLists.txtの作成（pyvers依存）
+- [x] 手順1A.4: CMakeLists.txtの作成（インストール済みVRS依存）
 - [ ] 手順1A.5: C++ VRSWriterラッパークラスのヘッダー設計
 - [ ] 手順1A.6: gtestのセットアップ
 - [ ] 手順1A.7: C++ VRSWriterラッパークラステストの作成 (RED)
@@ -2732,6 +2732,7 @@ git push -u origin <branch-name>
 | 2025-11-19 | 04:21:46 UTC+0000 | Claude (Sonnet 4.5) | コミット・プッシュ完了 | VRS submodule追加、pyvrs_writerディレクトリ作成、依存関係インストール、README.md・作業計画書更新をコミット（bcdd235）。次: VRSビルド実行。 |
 | 2025-11-19 | 04:22:00 UTC+0000 | Claude (Sonnet 4.5) | VRSビルド開始 | 追加依存関係インストール（libjpeg-dev, libeigen3-dev, libgtest-dev）。cmake設定成功、ninja build実行開始。 |
 | 2025-11-19 | 04:28:01 UTC+0000 | Claude (Sonnet 4.5) | **VRSビルド・インストール完了** | VRS C++ライブラリのビルド成功（261ターゲット）。third/vrs_install/にインストール完了。RecordFileWriter.h等のヘッダーファイル、libvrslib.a、vrslibConfig.cmake確認。README.md更新（追加依存関係記録）。 |
+| 2025-11-19 | 04:31:04 UTC+0000 | Claude (Sonnet 4.5) | 手順1A.4完了: CMakeLists.txt作成 | pyvrs_writer/CMakeLists.txt作成。pybind11-devインストール。vrslibConfig使用時のOcean依存問題を解決（直接ライブラリリンク方式に変更）。cmake構文チェック成功。README.md更新（pybind11-dev追加）。 |
 | | | | | |
 
 ---
