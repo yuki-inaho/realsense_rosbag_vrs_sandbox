@@ -2,7 +2,7 @@
 ROSbag to VRS Converter
 
 Converts RealSense D435i ROSbag files to VRS format.
-Phase 4A implementation: Color + Depth (必須)
+Color + Depth (必須)
 """
 import time
 from dataclasses import dataclass, field
@@ -51,7 +51,7 @@ class ConversionResult:
 
 class RosbagToVRSConverter:
     """
-    ROSbag to VRS converter (Phase 4A: Color + Depth)
+    ROSbag to VRS converter (Color + Depth)
 
     DRY/KISS/SOLID principles:
     - Single Responsibility: Only handles ROSbag -> VRS conversion
@@ -77,7 +77,10 @@ class RosbagToVRSConverter:
             "total_messages": 0,
             "messages_per_stream": {},
             "camera_info_cache": {},  # Cache CameraInfo messages
-            "transform_cache": {}  # Cache Transform messages (Phase 4C)
+            "transform_cache": {},  # Cache Transform messages
+            "stream_info_cache": {},  # Cache StreamInfo messages
+            "device_info_cache": {},  # Cache Device Info KeyValue pairs
+            "sensor_info_cache": {}  # Cache Sensor Info messages
         }
 
     def convert(self) -> ConversionResult:
@@ -113,9 +116,12 @@ class RosbagToVRSConverter:
             # Create streams
             self._create_streams(writer)
 
-            # Write configuration records (requires CameraInfo and Transform from bag)
+            # Write configuration records (requires CameraInfo, Transform, and Info data from bag)
             self._cache_camera_info(reader)
             self._cache_transforms(reader)
+            self._cache_stream_info(reader)
+            self._cache_device_info(reader)
+            self._cache_sensor_info(reader)
             self._write_configurations(writer)
 
             # Process messages in temporal order
@@ -203,7 +209,7 @@ class RosbagToVRSConverter:
 
     def _cache_transforms(self, reader: Any) -> None:
         """
-        Cache Transform messages for Configuration records (Phase 4C)
+        Cache Transform messages for Configuration records
 
         Transform topics:
         - /device_0/sensor_0/Depth_0/tf/0 (Depth Extrinsic)
@@ -237,6 +243,95 @@ class RosbagToVRSConverter:
                 if len(self._stats["transform_cache"]) >= len(transform_topics):
                     break
 
+    def _cache_stream_info(self, reader: Any) -> None:
+        """
+        Cache StreamInfo messages for Configuration records
+
+        StreamInfo topics:
+        - /device_0/sensor_0/Depth_0/info
+        - /device_0/sensor_1/Color_0/info
+        - /device_0/sensor_2/Accel_0/info
+        - /device_0/sensor_2/Gyro_0/info
+        """
+        stream_info_topics = [
+            "/device_0/sensor_0/Depth_0/info",
+            "/device_0/sensor_1/Color_0/info",
+            "/device_0/sensor_2/Accel_0/info",
+            "/device_0/sensor_2/Gyro_0/info"
+        ]
+
+        with reader:
+            connections = [x for x in reader.connections if x.topic in stream_info_topics]
+
+            if not connections:
+                if self.config.verbose:
+                    print("No StreamInfo topics found in ROSbag (skipping)")
+                return
+
+            for connection, timestamp, rawdata in reader.messages(connections=connections):
+                msg = reader.deserialize(rawdata, connection.msgtype)
+                self._stats["stream_info_cache"][connection.topic] = msg
+
+                if self.config.verbose:
+                    print(f"Cached StreamInfo from {connection.topic}: fps={msg.fps}, encoding={msg.encoding}")
+
+    def _cache_device_info(self, reader: Any) -> None:
+        """
+        Cache Device Info messages
+
+        Device Info topics:
+        - /device_0/info (multiple KeyValue pairs)
+        """
+        device_info_topic = "/device_0/info"
+        device_info_dict = {}
+
+        with reader:
+            connections = [x for x in reader.connections if x.topic == device_info_topic]
+
+            if not connections:
+                if self.config.verbose:
+                    print("No Device Info topics found in ROSbag (skipping)")
+                return
+
+            for connection, timestamp, rawdata in reader.messages(connections=connections):
+                msg = reader.deserialize(rawdata, connection.msgtype)
+                device_info_dict[msg.key] = msg.value
+
+            self._stats["device_info_cache"] = device_info_dict
+
+            if self.config.verbose:
+                print(f"Cached Device Info ({len(device_info_dict)} key-value pairs)")
+
+    def _cache_sensor_info(self, reader: Any) -> None:
+        """
+        Cache Sensor Info messages
+
+        Sensor Info topics:
+        - /device_0/sensor_0/info
+        - /device_0/sensor_1/info
+        - /device_0/sensor_2/info
+        """
+        sensor_info_topics = [
+            "/device_0/sensor_0/info",
+            "/device_0/sensor_1/info",
+            "/device_0/sensor_2/info"
+        ]
+
+        with reader:
+            connections = [x for x in reader.connections if x.topic in sensor_info_topics]
+
+            if not connections:
+                if self.config.verbose:
+                    print("No Sensor Info topics found in ROSbag (skipping)")
+                return
+
+            for connection, timestamp, rawdata in reader.messages(connections=connections):
+                msg = reader.deserialize(rawdata, connection.msgtype)
+                self._stats["sensor_info_cache"][connection.topic] = msg
+
+                if self.config.verbose:
+                    print(f"Cached Sensor Info from {connection.topic}: {msg.value}")
+
     def _write_configurations(self, writer: VRSWriter) -> None:
         """Write Configuration records for each stream"""
         for topic, stream_config in self.config.topic_mapping.items():
@@ -252,6 +347,10 @@ class RosbagToVRSConverter:
                 self._write_transform_depth_configuration(writer, stream_config, topic)
             elif stream_config.stream_type == "transform_color":
                 self._write_transform_color_configuration(writer, stream_config, topic)
+            elif stream_config.stream_type == "device_info":
+                self._write_device_info_configuration(writer, stream_config, topic)
+            elif stream_config.stream_type == "sensor_info":
+                self._write_sensor_info_configuration(writer, stream_config, topic)
 
     def _write_color_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
         """Write Color stream Configuration record"""
@@ -264,17 +363,27 @@ class RosbagToVRSConverter:
         config_data = {
             "width": int(camera_info.width),
             "height": int(camera_info.height),
-            "encoding": "rgb8",  # Default, will be overridden by actual message encoding
+            "encoding": "rgb8",  # Default, will be overridden by StreamInfo
             "camera_k": list(camera_info.K),  # 9 elements
             "camera_d": list(camera_info.D),  # 5 elements (distortion coefficients)
             "distortion_model": camera_info.distortion_model,
             "frame_id": camera_info.header.frame_id  # Store frame_id in configuration
         }
 
+        # Add StreamInfo if available
+        stream_info_topic = "/device_0/sensor_1/Color_0/info"
+        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
+
+        if stream_info:
+            config_data["fps"] = int(stream_info.fps)
+            config_data["encoding"] = str(stream_info.encoding)  # Override with actual encoding
+            config_data["is_recommended"] = bool(stream_info.is_recommended)
+
         writer.write_configuration(stream_config.stream_id, config_data)
 
         if self.config.verbose:
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Color): {camera_info.width}x{camera_info.height}")
+            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Color): {camera_info.width}x{camera_info.height}{fps_str}")
 
     def _write_depth_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
         """Write Depth stream Configuration record"""
@@ -287,7 +396,7 @@ class RosbagToVRSConverter:
         config_data = {
             "width": int(camera_info.width),
             "height": int(camera_info.height),
-            "encoding": "16UC1",  # Depth encoding
+            "encoding": "16UC1",  # Depth encoding, will be overridden by StreamInfo
             "camera_k": list(camera_info.K),
             "camera_d": list(camera_info.D),
             "distortion_model": camera_info.distortion_model,
@@ -295,10 +404,20 @@ class RosbagToVRSConverter:
             "frame_id": camera_info.header.frame_id  # Store frame_id in configuration
         }
 
+        # Add StreamInfo if available
+        stream_info_topic = "/device_0/sensor_0/Depth_0/info"
+        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
+
+        if stream_info:
+            config_data["fps"] = int(stream_info.fps)
+            config_data["encoding"] = str(stream_info.encoding)  # Override with actual encoding
+            config_data["is_recommended"] = bool(stream_info.is_recommended)
+
         writer.write_configuration(stream_config.stream_id, config_data)
 
         if self.config.verbose:
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Depth): {camera_info.width}x{camera_info.height}")
+            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Depth): {camera_info.width}x{camera_info.height}{fps_str}")
 
     def _write_imu_accel_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
         """Write IMU Accelerometer Configuration record"""
@@ -313,10 +432,20 @@ class RosbagToVRSConverter:
             "bias_variances": [0.0, 0.0, 0.0]
         }
 
+        # Add StreamInfo if available
+        stream_info_topic = "/device_0/sensor_2/Accel_0/info"
+        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
+
+        if stream_info:
+            config_data["fps"] = int(stream_info.fps)
+            config_data["encoding"] = str(stream_info.encoding)
+            config_data["is_recommended"] = bool(stream_info.is_recommended)
+
         writer.write_configuration(stream_config.stream_id, config_data)
 
         if self.config.verbose:
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Accel): {config_data['sample_rate']} Hz")
+            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Accel): {config_data['sample_rate']} Hz{fps_str}")
 
     def _write_imu_gyro_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
         """Write IMU Gyroscope Configuration record"""
@@ -331,13 +460,23 @@ class RosbagToVRSConverter:
             "bias_variances": [0.0, 0.0, 0.0]
         }
 
+        # Add StreamInfo if available
+        stream_info_topic = "/device_0/sensor_2/Gyro_0/info"
+        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
+
+        if stream_info:
+            config_data["fps"] = int(stream_info.fps)
+            config_data["encoding"] = str(stream_info.encoding)
+            config_data["is_recommended"] = bool(stream_info.is_recommended)
+
         writer.write_configuration(stream_config.stream_id, config_data)
 
         if self.config.verbose:
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Gyro): {config_data['sample_rate']} Hz")
+            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Gyro): {config_data['sample_rate']} Hz{fps_str}")
 
     def _write_transform_depth_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
-        """Write Depth Extrinsic Configuration record (Phase 4C)"""
+        """Write Depth Extrinsic Configuration record"""
         transform_msg = self._stats["transform_cache"].get(topic)
 
         if transform_msg is None:
@@ -378,7 +517,7 @@ class RosbagToVRSConverter:
                   f"T=({config_data['translation']['x']:.6f}, {config_data['translation']['y']:.6f}, {config_data['translation']['z']:.6f})")
 
     def _write_transform_color_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
-        """Write Color Extrinsic Configuration record (Phase 4C)"""
+        """Write Color Extrinsic Configuration record"""
         transform_msg = self._stats["transform_cache"].get(topic)
 
         if transform_msg is None:
@@ -409,6 +548,67 @@ class RosbagToVRSConverter:
         if self.config.verbose:
             print(f"Wrote Configuration for stream {stream_config.stream_id} (Color Extrinsic): "
                   f"T=({config_data['translation']['x']:.6f}, {config_data['translation']['y']:.6f}, {config_data['translation']['z']:.6f})")
+
+    def _write_device_info_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
+        """Write Device Info Configuration record"""
+        device_info_dict = self._stats.get("device_info_cache", {})
+
+        if not device_info_dict:
+            if self.config.verbose:
+                print(f"Device Info not found, skipping stream {stream_config.stream_id}")
+            return
+
+        # Build configuration from KeyValue pairs
+        config_data = {
+            "info_type": "device",
+            "device_name": device_info_dict.get("Name", "Unknown"),
+            "serial_number": device_info_dict.get("Serial Number", ""),
+            "firmware_version": device_info_dict.get("Firmware Version", ""),
+            "recommended_firmware_version": device_info_dict.get("Recommended Firmware Version", ""),
+            "physical_port": device_info_dict.get("Physical Port", ""),
+            "debug_op_code": device_info_dict.get("Debug Op Code", ""),
+            "advanced_mode": device_info_dict.get("Advanced Mode", ""),
+            "product_id": device_info_dict.get("Product Id", ""),
+            "usb_type_descriptor": device_info_dict.get("Usb Type Descriptor", "")
+        }
+
+        writer.write_configuration(stream_config.stream_id, config_data)
+
+        if self.config.verbose:
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Device Info): {config_data['device_name']} (SN: {config_data['serial_number']})")
+
+    def _write_sensor_info_configuration(self, writer: VRSWriter, stream_config: StreamConfig, topic: str) -> None:
+        """Write Sensor Info Configuration record"""
+        sensor_info_msg = self._stats["sensor_info_cache"].get(topic)
+
+        if sensor_info_msg is None:
+            if self.config.verbose:
+                print(f"Sensor Info not found for {topic}, skipping stream {stream_config.stream_id}")
+            return
+
+        # Extract sensor_id from topic (e.g., "/device_0/sensor_0/info" -> "sensor_0")
+        sensor_id = topic.split("/")[2] if len(topic.split("/")) > 2 else "unknown"
+
+        # Determine associated streams based on sensor_id
+        associated_streams = []
+        if sensor_id == "sensor_0":
+            associated_streams = [1002, 1005]  # Depth, Depth Extrinsic
+        elif sensor_id == "sensor_1":
+            associated_streams = [1001, 1006]  # Color, Color Extrinsic
+        elif sensor_id == "sensor_2":
+            associated_streams = [1003, 1004]  # Accel, Gyro
+
+        config_data = {
+            "info_type": "sensor",
+            "sensor_id": sensor_id,
+            "sensor_name": sensor_info_msg.value,
+            "associated_streams": associated_streams
+        }
+
+        writer.write_configuration(stream_config.stream_id, config_data)
+
+        if self.config.verbose:
+            print(f"Wrote Configuration for stream {stream_config.stream_id} (Sensor Info): {config_data['sensor_name']} ({sensor_id})")
 
     def _process_messages(self, reader: Any, writer: VRSWriter) -> None:
         """Process all messages in temporal order"""
@@ -468,7 +668,7 @@ class RosbagToVRSConverter:
         writer.write_data(stream_config.stream_id, timestamp_sec, depth_data)
 
     def _process_imu_accel_message(self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int) -> None:
-        """Process IMU Accelerometer message (Phase 4B)"""
+        """Process IMU Accelerometer message"""
         import struct
 
         # Convert timestamp (nanoseconds -> seconds)
@@ -487,7 +687,7 @@ class RosbagToVRSConverter:
         writer.write_data(stream_config.stream_id, timestamp_sec, imu_data)
 
     def _process_imu_gyro_message(self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int) -> None:
-        """Process IMU Gyroscope message (Phase 4B)"""
+        """Process IMU Gyroscope message"""
         import struct
 
         # Convert timestamp (nanoseconds -> seconds)
@@ -573,6 +773,30 @@ RGBD_IMU_STREAMS = {
         recordable_type_id="MotionSensor",
         flavor="RealSense_D435i_Gyro|id:1004"
     ),
+    "/device_0/info": StreamConfig(
+        stream_id=2001,
+        stream_type="device_info",
+        recordable_type_id="ForwardCamera",
+        flavor="RealSense_D435i_Device_Info|id:2001"
+    ),
+    "/device_0/sensor_0/info": StreamConfig(
+        stream_id=2002,
+        stream_type="sensor_info",
+        recordable_type_id="ForwardCamera",
+        flavor="RealSense_D435i_Sensor0_Info|id:2002"
+    ),
+    "/device_0/sensor_1/info": StreamConfig(
+        stream_id=2003,
+        stream_type="sensor_info",
+        recordable_type_id="ForwardCamera",
+        flavor="RealSense_D435i_Sensor1_Info|id:2003"
+    ),
+    "/device_0/sensor_2/info": StreamConfig(
+        stream_id=2004,
+        stream_type="sensor_info",
+        recordable_type_id="ForwardCamera",
+        flavor="RealSense_D435i_Sensor2_Info|id:2004"
+    ),
 }
 
 
@@ -587,10 +811,10 @@ def create_rgbd_config(compression: str = "lz4", verbose: bool = False) -> Conve
 
 
 def create_rgbd_imu_config(compression: str = "lz4", verbose: bool = False) -> ConverterConfig:
-    """Create RGB-D + IMU + Transform converter configuration"""
+    """Create RGB-D + IMU + Transform + Device/Sensor Info converter configuration"""
     return ConverterConfig(
         topic_mapping=RGBD_IMU_STREAMS,
-        phase="rgbd_imu",
+        phase="rgbd_imu_info",
         compression=compression,
         verbose=verbose
     )
