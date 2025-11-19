@@ -44,3 +44,7 @@ test_minimal_vrs.cpp
 test_pytest_vrs.py
 test_read_recordformat.py
 test_recordformat.py
+
+# VRS C++ Reader verification test files (Phase 5)
+test_vrs_cpp_reader.cpp
+test_vrs_cpp_reader
