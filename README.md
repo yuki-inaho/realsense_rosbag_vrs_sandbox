@@ -42,10 +42,50 @@ Source: [IntelRealSense/librealsense Sample Data](https://github.com/IntelRealSe
 
 ## Usage
 
+### Extract bag information
+
+Display information about topics and message counts:
+
 ```bash
-# Extract data from ROSbag with timestamps
+# Basic information
 uv run python extract_realsense_data.py data/rosbag/d435i_walk_around.bag
+
+# Verbose mode with timestamps
+uv run python extract_realsense_data.py data/rosbag/d435i_walk_around.bag --verbose
 ```
+
+### Stream synchronized sensor data
+
+Stream RGB-D-IR and IMU data in chronological order:
+
+```bash
+# Stream all sensor data
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag
+
+# Stream data between specific times (seconds from start)
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag --start 1.0 --end 5.0
+
+# Stream only specific sensors (rgb, depth, ir, accel, gyro)
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag --sensors rgb depth
+
+# Show first N messages
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag --limit 20
+
+# Output in CSV format
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag --format csv > output.csv
+
+# Output in JSON format
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag --format json > output.json
+
+# Combine filters
+uv run python stream_realsense_data.py data/rosbag/d435i_walk_around.bag \
+  --start 2.0 --end 8.0 --sensors rgb depth accel gyro --format csv
+```
+
+**Output formats:**
+- `human` (default): Human-readable format with timestamps
+- `csv`: CSV format with headers
+- `json`: JSON array format
 
 ## Development
 
