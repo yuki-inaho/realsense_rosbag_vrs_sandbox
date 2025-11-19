@@ -28,8 +28,28 @@ Thumbs.db
 
 # Sample data files (large files)
 data/rosbag/d435i_walk_around.bag
+data/rosbag/d435i_walking.bag
 data/rosbag/sample_d435i.bag
+data/rosbag/d435i_sample_data.zip
+
+# VRS output files
+data/vrs/
 
 # Keep only LFS-tracked user data
 !data/rosbag/20251119_112125.bag
 third/vrs_install/
+pyvrs_writer/build/
+
+# Debug files from Phase 1A blocker resolution
+debug_vrs.py
+test_minimal_vrs
+test_minimal_vrs.cpp
+
+# RecordFormat implementation test files
+test_pytest_vrs.py
+test_read_recordformat.py
+test_recordformat.py
+
+# VRS C++ Reader verification test files (Phase 5)
+test_vrs_cpp_reader.cpp
+test_vrs_cpp_reader

@@ -1,0 +1,8 @@
+README.md
+setup.py
+python/pyvrs_writer/__init__.py
+python/pyvrs_writer.egg-info/PKG-INFO
+python/pyvrs_writer.egg-info/SOURCES.txt
+python/pyvrs_writer.egg-info/dependency_links.txt
+python/pyvrs_writer.egg-info/not-zip-safe
+python/pyvrs_writer.egg-info/top_level.txt

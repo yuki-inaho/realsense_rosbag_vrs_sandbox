@@ -8,6 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Threads検索
 find_package(Threads REQUIRED)
 
+# Boost Filesystemの検索
+find_package(Boost REQUIRED COMPONENTS filesystem system)
+
+# fmtライブラリの検索
+find_package(fmt REQUIRED)
+
+# 圧縮ライブラリ
+find_library(LZ4_LIBRARY NAMES lz4 REQUIRED)
+find_library(ZSTD_LIBRARY NAMES zstd REQUIRED)
+find_library(XXHASH_LIBRARY NAMES xxhash REQUIRED)
+
 # VRSライブラリのパスを設定
 set(VRS_INSTALL_DIR "${CMAKE_SOURCE_DIR}/../third/vrs_install")
 set(VRS_INCLUDE_DIR "${VRS_INSTALL_DIR}/include")
@@ -36,15 +47,27 @@ add_library(vrs_writer_core STATIC
   src/vrs_writer.cpp
 )
 
+# pybind11用に-fPICフラグを追加
+set_target_properties(vrs_writer_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 target_link_libraries(vrs_writer_core
+  -Wl,--start-group
   ${VRS_LIB_DIR}/libvrslib.a
   ${VRS_LIB_DIR}/libvrs_utils.a
+  ${VRS_LIB_DIR}/libvrs_utils_xxhash.a
   ${VRS_LIB_DIR}/libvrs_os.a
   ${VRS_LIB_DIR}/libvrs_helpers.a
   ${VRS_LIB_DIR}/libvrs_logging.a
   ${VRS_LIB_DIR}/libocean_cv.a
   ${VRS_LIB_DIR}/libocean_math.a
   ${VRS_LIB_DIR}/libocean_base.a
+  -Wl,--end-group
+  Boost::filesystem
+  Boost::system
+  fmt::fmt
+  ${LZ4_LIBRARY}
+  ${ZSTD_LIBRARY}
+  ${XXHASH_LIBRARY}
   Threads::Threads
 )
 
