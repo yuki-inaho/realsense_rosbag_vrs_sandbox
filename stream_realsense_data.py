@@ -20,16 +20,16 @@ Usage:
 
 import argparse
 import sys
-from pathlib import Path
-from typing import Iterator, Any
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from scripts.rosbag_reader import RosbagReader
 from scripts.timestamp_handler import (
+    format_timestamp_iso,
     ros_timestamp_to_datetime,
     ros_timestamp_to_seconds,
-    format_timestamp_iso,
 )
 
 
@@ -182,9 +182,7 @@ Examples:
         """,
     )
 
-    parser.add_argument(
-        "bagfile", type=Path, help="Path to the ROS bag file"
-    )
+    parser.add_argument("bagfile", type=Path, help="Path to the ROS bag file")
 
     parser.add_argument(
         "--start",

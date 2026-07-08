@@ -1,423 +1,117 @@
 # VRS API チートシート
 
-VRS (Virtual Reality Stream) APIの逆引きリファレンス
+このリポジトリで使う VRS / PyVRS API の最小リファレンスです。
 
 ---
 
-## 目次
+## 読み込み
 
-1. [PyVRS (読み込み)](#pyvrs-読み込み)
-2. [pyvrs_writer (書き込み)](#pyvrs_writer-書き込み)
-3. [データ構造](#データ構造)
-4. [よくあるタスク](#よくあるタスク)
+### Repository reader
 
----
+通常は `scripts.vrs_reader.VRSReader` を使います。logical stream id、configuration JSON、payload bytes をリポジトリの writer adapter と同じ規約で復元します。
 
-## PyVRS (読み込み)
+```python
+from scripts.vrs_reader import VRSReader
 
-### VRSファイルを開く
+with VRSReader("output.vrs") as reader:
+    print(reader.get_stream_ids())
+    config = reader.read_configuration(1001)
+    records = list(reader.read_data_records(1001))
+
+print(config["encoding"])
+print(records[0]["timestamp"], records[0]["data"])
+```
+
+### Raw PyVRS reader
+
+公式 reader を直接使う場合は `SyncVRSReader` を iterable として扱います。
 
 ```python
 import pyvrs
 
-# VRSファイルを開く
-reader = pyvrs.SyncVRSReader("file.vrs")
-reader.open()
+reader = pyvrs.SyncVRSReader("output.vrs")
 
-# 使用後は必ず閉じる
-reader.close()
+for stream_id in reader.stream_ids:
+    print(stream_id, reader.get_stream_info(stream_id))
+
+for record in reader:
+    print(record.stream_id, record.record_type, record.timestamp)
+    if record.n_metadata_blocks:
+        print(record.metadata_blocks[0])
+    if getattr(record, "n_image_blocks", 0):
+        payload = record.image_blocks[0].tobytes()
 ```
 
-### ストリーム一覧を取得
-
-```python
-# すべてのストリームを取得
-streams = reader.get_streams()
-
-for stream in streams:
-    print(f"Stream ID: {stream.stream_id}")
-    print(f"  Recordable Type: {stream.recordable_type_id}")
-    print(f"  Flavor: {stream.flavor}")
-```
-
-### レコードを読み取る
-
-```python
-# すべてのレコードをイテレート
-for record in reader.records():
-    print(f"Stream ID: {record.stream_id.numeric_name}")
-    print(f"Timestamp: {record.timestamp}")
-    print(f"Record Type: {record.record_type}")  # CONFIGURATION, STATE, DATA
-```
-
-### Configuration レコードを読み取る
-
-```python
-# Configuration レコードのみフィルタ
-config_records = [r for r in reader.records()
-                 if r.record_type == pyvrs.RecordType.CONFIGURATION]
-
-for record in config_records:
-    # メタデータブロック（JSONデータ）を取得
-    if record.metadata_blocks:
-        metadata = record.metadata_blocks[0]
-        print(f"Configuration: {metadata}")
-```
-
-### Data レコードを読み取る
-
-```python
-# Data レコードのみフィルタ
-data_records = [r for r in reader.records()
-               if r.record_type == pyvrs.RecordType.DATA]
-
-for record in data_records:
-    timestamp = record.timestamp
-
-    # カスタムブロック（画像データ等）を取得
-    if record.custom_blocks:
-        data = record.custom_blocks[0]
-        print(f"Data size: {len(data)} bytes")
-```
+`reader.stream_tags` には repository adapter が保存する `user_stream_id`, `user_stream_name`, `config_json` が入ります。
 
 ---
 
-## pyvrs_writer (書き込み)
+## 書き込み
 
-### VRSファイルを作成
+### Repository writer adapter
 
-```python
-from pyvrs_writer import VRSWriter
-
-# VRSファイルを作成（コンテキストマネージャ推奨）
-with VRSWriter("output.vrs") as writer:
-    # ストリーム追加
-    writer.add_stream(1001, "CameraStream_Color")
-
-    # Configuration書き込み
-    writer.write_configuration(1001, {"width": 640, "height": 480})
-
-    # Data書き込み
-    writer.write_data(1001, 1234567890.123, b'image_data_here')
-```
-
-### ストリームを追加
+通常は `scripts.vrs_writer.VRSWriter` を使います。公式 PyVRS writer の上に、既存 converter-facing API を維持する薄い adapter を置いています。
 
 ```python
-writer = VRSWriter("output.vrs")
+from scripts.vrs_writer import VRSWriter
 
-# ストリーム追加（ID, flavor名）
-writer.add_stream(1001, "RealSense_Color")
-writer.add_stream(1002, "RealSense_Depth")
-
-# 重複チェックは自動で行われる
-```
-
-### Configuration レコードを書き込む
-
-```python
-# Configurationは辞書形式
-config_data = {
-    "width": 640,
-    "height": 480,
-    "encoding": "rgb8",
-    "camera_k": [fx, 0, cx, 0, fy, cy, 0, 0, 1],
-    "camera_d": [k1, k2, p1, p2, k3],
-    "distortion_model": "plumb_bob"
-}
-
-writer.write_configuration(stream_id=1001, config=config_data)
-```
-
-### Data レコードを書き込む
-
-```python
-# タイムスタンプとバイナリデータを指定
-timestamp = 1234567890.123  # Unix timestamp (float)
-image_bytes = b'\x00\x01\x02...'  # バイナリデータ
-
-writer.write_data(
-    stream_id=1001,
-    timestamp=timestamp,
-    data=image_bytes
-)
-```
-
-### ファイルを閉じる
-
-```python
-# 明示的に閉じる
-writer.close()
-
-# またはコンテキストマネージャで自動クローズ
-with VRSWriter("output.vrs") as writer:
-    # ... 書き込み処理
-    pass  # ブロック終了時に自動でclose()が呼ばれる
-```
-
----
-
-## データ構造
-
-### StreamId
-
-```python
-# ストリームIDは数値で指定
-stream_id = 1001
-
-# VRSでは内部的にRecordableTypeIDとInstanceIDの組み合わせ
-# 例: RecordableTypeID=1, InstanceID=1 → 1001
-```
-
-### RecordType
-
-```python
-import pyvrs
-
-# 3種類のレコードタイプ
-pyvrs.RecordType.CONFIGURATION  # 設定情報（最初に1回）
-pyvrs.RecordType.STATE         # 状態変化（オプション）
-pyvrs.RecordType.DATA          # データ（多数）
-```
-
-### Timestamp
-
-```python
-# Unix timestamp (秒単位、float)
-import time
-
-timestamp = time.time()  # 1234567890.123456
-```
-
----
-
-## よくあるタスク
-
-### タスク1: VRSファイルの内容を表示
-
-```python
-import pyvrs
-
-reader = pyvrs.SyncVRSReader("file.vrs")
-reader.open()
-
-# ストリーム一覧
-streams = reader.get_streams()
-print(f"Total streams: {len(streams)}")
-
-# 各ストリームの情報
-for stream in streams:
-    print(f"\nStream {stream.stream_id}:")
-
-    # レコード数をカウント
-    config_count = sum(1 for r in reader.records()
-                      if r.stream_id == stream.stream_id
-                      and r.record_type == pyvrs.RecordType.CONFIGURATION)
-    data_count = sum(1 for r in reader.records()
-                    if r.stream_id == stream.stream_id
-                    and r.record_type == pyvrs.RecordType.DATA)
-
-    print(f"  Configuration records: {config_count}")
-    print(f"  Data records: {data_count}")
-
-reader.close()
-```
-
-### タスク2: ROSbag Image を VRS に変換
-
-```python
-from pyvrs_writer import VRSWriter
-import struct
-
-# sensor_msgs/Image から変換
-def convert_image_to_vrs(writer, stream_id, msg, timestamp):
-    """
-    ROSメッセージ (sensor_msgs/Image) をVRSに書き込む
-
-    Args:
-        writer: VRSWriter instance
-        stream_id: int
-        msg: sensor_msgs/Image
-        timestamp: float (Unix timestamp)
-    """
-    # 画像データを取得（すでにバイト列）
-    image_data = bytes(msg.data) if not isinstance(msg.data, bytes) else msg.data
-
-    # VRSに書き込み
-    writer.write_data(stream_id, timestamp, image_data)
-```
-
-### タスク3: カメラ内部パラメータを保存
-
-```python
-from pyvrs_writer import VRSWriter
-
-# sensor_msgs/CameraInfo から Configuration を作成
-def write_camera_config(writer, stream_id, camera_info):
-    """
-    カメラ内部パラメータをConfigurationレコードとして保存
-
-    Args:
-        writer: VRSWriter instance
-        stream_id: int
-        camera_info: sensor_msgs/CameraInfo
-    """
-    config = {
-        "width": int(camera_info.width),
-        "height": int(camera_info.height),
-        "camera_k": list(camera_info.K),  # 3x3行列（row-major, 9要素）
-        "camera_d": list(camera_info.D),  # 歪み係数（5要素）
-        "distortion_model": camera_info.distortion_model,
-        "frame_id": camera_info.header.frame_id
-    }
-
-    writer.write_configuration(stream_id, config)
-```
-
-### タスク4: IMUデータを保存
-
-```python
-from pyvrs_writer import VRSWriter
-import struct
-
-def write_imu_data(writer, stream_id, imu_msg, timestamp):
-    """
-    IMUデータをVRSに書き込む
-
-    Args:
-        writer: VRSWriter instance
-        stream_id: int
-        imu_msg: sensor_msgs/Imu
-        timestamp: float
-    """
-    # 加速度データをパック (3 doubles)
-    accel_data = struct.pack(
-        'ddd',
-        imu_msg.linear_acceleration.x,
-        imu_msg.linear_acceleration.y,
-        imu_msg.linear_acceleration.z
+with VRSWriter("output.vrs", compression="lz4") as writer:
+    writer.add_stream(1001, "RealSense_D435i_Color")
+    writer.write_configuration(
+        1001,
+        {"width": 640, "height": 480, "encoding": "rgb8"},
     )
-
-    # VRSに書き込み
-    writer.write_data(stream_id, timestamp, accel_data)
-
-def write_imu_config(writer, stream_id):
-    """IMU Configuration"""
-    config = {
-        "sensor_type": "accelerometer",
-        "unit": "m/s^2",
-        "range": 4.0,  # +/- 4G
-        "sample_rate": 250.0,  # Hz
-    }
-    writer.write_configuration(stream_id, config)
+    writer.write_data(1001, 0.125, b"image-bytes")
 ```
 
-### タスク5: VRSファイルから画像を復元
+対応 compression は `lz4`, `zstd`, `none` です。
+
+### 公式 PyVRS writer loader
+
+PyPI `vrs==1.2.2` の `pyvrs.writer` は direct import 時に native symbol export 欠落で失敗するため、site-packages は変更せず loader 内で補正します。
 
 ```python
-import pyvrs
-import numpy as np
+from scripts.vrs_writer import load_official_writer_backend
 
-def read_image_from_vrs(reader, stream_id, record_index=0):
-    """
-    VRSファイルから画像データを読み取る
-
-    Args:
-        reader: pyvrs.SyncVRSReader
-        stream_id: int
-        record_index: int (何番目のDataレコードか)
-
-    Returns:
-        numpy array (画像データ)
-    """
-    # 指定ストリームのDataレコードのみ取得
-    data_records = [r for r in reader.records()
-                   if r.stream_id.numeric_name == stream_id
-                   and r.record_type == pyvrs.RecordType.DATA]
-
-    if record_index >= len(data_records):
-        raise IndexError("Record index out of range")
-
-    record = data_records[record_index]
-
-    # カスタムブロックから画像データを取得
-    if record.custom_blocks:
-        image_bytes = record.custom_blocks[0]
-
-        # Configurationから画像サイズを取得（事前に読み込んでおく）
-        # width, height, encoding を使ってnumpy配列に変換
-        # 例: RGB画像の場合
-        # image = np.frombuffer(image_bytes, dtype=np.uint8).reshape(height, width, 3)
-
-        return image_bytes
-
-    return None
+import_path, writer_cls, pyvrs = load_official_writer_backend()
+assert import_path == "pyvrs.writer.VRSWriter"
 ```
 
-### タスク6: 特定時間範囲のレコードを抽出
+adapter は公式 writer の `sample_with_image` factory を使います。logical stream id と configuration は stream tags、payload は image block に保存します。これにより repository reader との roundtrip は可能ですが、外部 VRS consumer 向けの意味論的 recordable 型は未保証です。
+
+---
+
+## 変換
 
 ```python
-def read_records_in_time_range(reader, stream_id, start_time, end_time):
-    """
-    指定時間範囲のレコードを抽出
+from pathlib import Path
 
-    Args:
-        reader: pyvrs.SyncVRSReader
-        stream_id: int
-        start_time: float (Unix timestamp)
-        end_time: float (Unix timestamp)
+from scripts.rosbag_to_vrs_converter import (
+    RosbagToVRSConverter,
+    create_rgbd_config,
+    create_rgbd_imu_config,
+)
 
-    Returns:
-        list of records
-    """
-    records = []
-
-    for record in reader.records():
-        if record.stream_id.numeric_name != stream_id:
-            continue
-
-        if record.record_type != pyvrs.RecordType.DATA:
-            continue
-
-        if start_time <= record.timestamp <= end_time:
-            records.append(record)
-
-    return records
+converter = RosbagToVRSConverter(
+    Path("input.bag"),
+    Path("output.vrs"),
+    create_rgbd_imu_config(compression="lz4"),
+)
+result = converter.convert()
+print(result.messages_per_stream)
 ```
 
----
-
-## API制約と注意事項
-
-### pyvrs_writer の制約
-
-1. **RecordFormat 未対応**: 現在の実装ではDataLayoutを動的に定義できない
-2. **Configuration は JSON 辞書のみ**: 構造化されたバイナリデータは不可
-3. **ストリームIDの重複不可**: 同じIDで複数回 `add_stream()` するとエラー
-
-### PyVRS の制約
-
-1. **Linux/macOS のみサポート**: Windows版は開発中
-2. **ランダムアクセス制限**: シーケンシャル読み込みのみ効率的
-3. **大容量ファイル**: メモリマッピングを使用するため、十分なメモリが必要
-
-### ベストプラクティス
-
-1. **コンテキストマネージャを使用**: `with VRSWriter(...) as writer:` で確実にクローズ
-2. **Configuration を最初に書き込む**: Data レコードより前に書き込む
-3. **タイムスタンプは単調増加**: 同じストリーム内では時系列順に書き込む
-4. **エラーハンドリング**: `try-except` でファイルI/Oエラーをキャッチ
+テストでは `reader_factory` と `writer_factory` を明示注入できます。通常経路で暗黙の fallback はしません。
 
 ---
 
-## 参考リンク
+## 回帰テスト
 
-- [VRS 公式ドキュメント](https://facebookresearch.github.io/vrs/)
-- [PyVRS GitHub](https://github.com/facebookresearch/pyvrs)
-- [VRS C++ API](https://facebookresearch.github.io/vrs/doxygen/)
+```bash
+uv run pytest -q -m "not integration"
+uv run pytest -q tests/test_official_pyvrs_writer.py tests/test_vrs_writer_adapter.py
+uv run pytest -q tests/test_converter_synthetic.py tests/test_cli_smoke.py
+REALSENSE_ROSBAG_PATH=/absolute/path/to/sample.bag uv run pytest -q -m integration
+```
 
----
-
-**作成日:** 2025-11-19
-**更新日:** 2025-11-19
-**バージョン:** 1.0.0
+実 rosbag がない環境では integration tests は skip または deselect されます。

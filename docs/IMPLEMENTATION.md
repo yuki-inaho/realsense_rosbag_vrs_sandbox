@@ -1,6 +1,6 @@
 # 実装詳細: RealSense ROSbag → VRS 変換システム
 
-**RealSense D435i ROSbagと同等のカメラパラメータ取得 + RGB-D-IR + IMU記録・再生システムの実装詳細**
+**RealSense D435i ROSbagのRGB-D、IMU、Transform、Device/Sensor Info、OptionsをVRSへ保存・再生するシステムの実装詳細**
 
 ---
 
@@ -10,8 +10,8 @@
 2. [クラス構造とAPI](#クラス構造とapi)
 3. [データフロー](#データフロー)
 4. [カメラパラメータ取得と保存](#カメラパラメータ取得と保存)
-5. [実装済み機能 (Phase 4A)](#実装済み機能-phase-4a)
-6. [未実装機能と実装ロードマップ](#未実装機能と実装ロードマップ)
+5. [実装済み機能](#実装済み機能)
+6. [未対応機能とロードマップ](#未対応機能とロードマップ)
 7. [VRS APIの使用方法](#vrs-apiの使用方法)
 
 ---
@@ -28,8 +28,8 @@ graph TB
         RB_DEPTH[Depth Image Topic<br/>/device_0/sensor_0/Depth_0/image/data]
         RB_COLOR_INFO[Color CameraInfo<br/>/device_0/sensor_1/Color_0/info/camera_info]
         RB_DEPTH_INFO[Depth CameraInfo<br/>/device_0/sensor_0/Depth_0/info/camera_info]
-        RB_IMU_ACCEL[IMU Accel ⚠️未実装<br/>/device_0/sensor_2/Accel_0/imu/data]
-        RB_IMU_GYRO[IMU Gyro ⚠️未実装<br/>/device_0/sensor_2/Gyro_0/imu/data]
+        RB_IMU_ACCEL[IMU Accel<br/>/device_0/sensor_2/Accel_0/imu/data]
+        RB_IMU_GYRO[IMU Gyro<br/>/device_0/sensor_2/Gyro_0/imu/data]
 
         RB --> RB_COLOR
         RB --> RB_DEPTH
@@ -40,7 +40,7 @@ graph TB
     end
 
     subgraph "Processing Layer"
-        READER[AnyReader<br/>rosbags 0.11.0]
+        READER[AnyReader<br/>rosbags 0.11.3]
         CONVERTER[RosbagToVRSConverter]
         WRITER[VRSWriter]
 
@@ -48,8 +48,8 @@ graph TB
         RB_DEPTH --> READER
         RB_COLOR_INFO --> READER
         RB_DEPTH_INFO --> READER
-        RB_IMU_ACCEL -.->|Phase 4B| READER
-        RB_IMU_GYRO -.->|Phase 4B| READER
+        RB_IMU_ACCEL --> READER
+        RB_IMU_GYRO --> READER
 
         READER --> CONVERTER
         CONVERTER --> WRITER
@@ -59,14 +59,14 @@ graph TB
         VRS[VRS File]
         STREAM1001[Stream 1001<br/>Color + K matrix + D coeffs]
         STREAM1002[Stream 1002<br/>Depth + K matrix + D coeffs + depth_scale]
-        STREAM1003[Stream 1003 ⚠️未実装<br/>IMU Accelerometer]
-        STREAM1004[Stream 1004 ⚠️未実装<br/>IMU Gyroscope]
+        STREAM1003[Stream 1003<br/>IMU Accelerometer]
+        STREAM1004[Stream 1004<br/>IMU Gyroscope]
 
         WRITER --> VRS
         VRS --> STREAM1001
         VRS --> STREAM1002
-        VRS -.-> STREAM1003
-        VRS -.-> STREAM1004
+        VRS --> STREAM1003
+        VRS --> STREAM1004
     end
 
     subgraph "Verification Layer"
@@ -77,10 +77,6 @@ graph TB
         VRS_READER --> INSPECTOR
     end
 
-    style RB_IMU_ACCEL fill:#ffcccc,stroke:#ff0000,stroke-dasharray: 5 5
-    style RB_IMU_GYRO fill:#ffcccc,stroke:#ff0000,stroke-dasharray: 5 5
-    style STREAM1003 fill:#ffcccc,stroke:#ff0000,stroke-dasharray: 5 5
-    style STREAM1004 fill:#ffcccc,stroke:#ff0000,stroke-dasharray: 5 5
 ```
 
 ---
@@ -92,11 +88,11 @@ graph TB
 ```mermaid
 classDiagram
     class VRSWriter {
-        -_writer: _pyvrs_writer.VRSWriter
+        -_writer: pyvrs.writer.VRSWriter
         -_filepath: Path
-        -_stream_ids: set[int]
-        +__init__(filepath: Path)
-        +add_stream(stream_id: int, flavor: str) str
+        -_stream_states: dict[int, StreamState]
+        +__init__(filepath: Path, compression: str)
+        +add_stream(stream_id: int, flavor: str)
         +write_configuration(stream_id: int, config: dict)
         +write_data(stream_id: int, timestamp: float, data: bytes)
         +is_open() bool
@@ -167,7 +163,7 @@ classDiagram
 
 | クラス名 | 役割 | ファイル |
 |---------|------|---------|
-| `VRSWriter` | VRSファイルへの書き込み（pyvrs_writerラッパー） | `scripts/vrs_writer.py:38` |
+| `VRSWriter` | VRSファイルへの書き込み（公式 PyVRS writer adapter） | `scripts/vrs_writer.py` |
 | `VRSReader` | VRSファイルからの読み込み（PyVRSラッパー） | `scripts/vrs_reader.py:20` |
 | `RosbagToVRSConverter` | ROSbag → VRS 変換ロジック | `scripts/rosbag_to_vrs_converter.py:84` |
 | `ConverterConfig` | 変換設定（ストリームマッピング、圧縮等） | `scripts/rosbag_to_vrs_converter.py:24` |
@@ -312,7 +308,7 @@ def _cache_camera_info(self, reader: Any) -> None:
                       if x.topic in camera_info_topics]
 
         for connection, timestamp, rawdata in reader.messages(connections=connections):
-            # rosbags 0.11.0 API
+            # rosbags 0.11.3 API
             msg = reader.deserialize(rawdata, connection.msgtype)
             self._stats["camera_info_cache"][connection.topic] = msg
 ```
@@ -358,7 +354,7 @@ def _write_color_configuration(self, writer: VRSWriter, ...) -> None:
 
 ---
 
-## 実装済み機能 (Phase 4A)
+## 実装済み機能
 
 ### ✅ Color Stream (Stream ID: 1001)
 
@@ -397,80 +393,22 @@ def _write_color_configuration(self, writer: VRSWriter, ...) -> None:
 
 ---
 
-## 未実装機能と実装ロードマップ
+### IMU / Transform / Device Info / Options
 
-### 🚧 Phase 4B: IMU Streams (未実装)
+`create_rgbd_imu_config()` は Color/Depth に加えて以下の stream を含みます。
 
-#### 必要な実装
+| Stream ID | 種別 | 内容 |
+|----------:|------|------|
+| 1003 | IMU Accel | `sensor_msgs/Imu.linear_acceleration` を double x3 として保存 |
+| 1004 | IMU Gyro | `sensor_msgs/Imu.angular_velocity` を double x3 として保存 |
+| 1005, 1006 | Transform | Depth/Color extrinsic configuration |
+| 2001 | Device Info | device key-value metadata |
+| 2002-2004 | Sensor Info | sensor module metadata |
+| 2005 | Options | sensor option value/description metadata |
 
-**1. Stream 定義の追加**
+## 未対応機能とロードマップ
 
-```python
-# scripts/rosbag_to_vrs_converter.py に追加
-STREAM_ID_IMU_ACCEL = 1003
-STREAM_ID_IMU_GYRO = 1004
-
-def create_phase_4b_config(...) -> ConverterConfig:
-    return ConverterConfig(
-        phase="4B",
-        topic_mapping={
-            "/device_0/sensor_2/Accel_0/imu/data": StreamConfig(
-                stream_id=1003,
-                stream_type="imu_accel",
-                recordable_type_id="MotionSensor",
-                flavor="RealSense_D435i_Accel"
-            ),
-            "/device_0/sensor_2/Gyro_0/imu/data": StreamConfig(
-                stream_id=1004,
-                stream_type="imu_gyro",
-                recordable_type_id="MotionSensor",
-                flavor="RealSense_D435i_Gyro"
-            ),
-        },
-        # ... Color/Depth も含める
-    )
-```
-
-**2. IMU Configuration レコード作成**
-
-```python
-def _write_imu_accel_configuration(self, writer: VRSWriter, ...) -> None:
-    """IMU Accelerometer Configuration レコードを書き込み"""
-    config_data = {
-        "sensor_type": "accelerometer",
-        "unit": "m/s^2",
-        "range": 4.0,  # ±4G
-        "sample_rate": 250.0,  # 250 Hz
-        "frame_id": "imu_link"
-    }
-    writer.write_configuration(stream_id, config_data)
-```
-
-**3. IMU Data レコード処理**
-
-```python
-def _process_imu_accel_message(self, msg, timestamp: float) -> bytes:
-    """IMU加速度データを変換"""
-    # sensor_msgs/Imu -> bytes
-    accel_data = struct.pack(
-        'ddd',  # double x3
-        msg.linear_acceleration.x,
-        msg.linear_acceleration.y,
-        msg.linear_acceleration.z
-    )
-    return accel_data
-```
-
-**必要な修正箇所:**
-1. `scripts/rosbag_to_vrs_converter.py:84` - `RosbagToVRSConverter`クラス
-   - `_write_imu_accel_configuration()` メソッド追加
-   - `_write_imu_gyro_configuration()` メソッド追加
-   - `_process_imu_accel_message()` メソッド追加
-   - `_process_imu_gyro_message()` メソッド追加
-2. `scripts/rosbag_to_vrs_converter.py:258` - `_process_messages()`
-   - IMU トピックの分岐処理を追加
-
-### 🚧 IR (Infrared) Stream (未実装)
+### IR (Infrared) Stream
 
 #### 必要な構造
 
@@ -510,23 +448,23 @@ StreamConfig(
 
 | 機能 | Phase | 優先度 | 理由 |
 |-----|-------|-------|------|
-| Color + Depth | 4A | ✅ 完了 | 最も基本的なRGB-D機能 |
-| IMU (Accel/Gyro) | 4B | 🔴 高 | SLAM/VIO に必須 |
-| IR (Infrared) | 4C | 🟡 中 | ステレオマッチングに有用 |
-| TF (Transforms) | 4D | 🟢 低 | 座標変換情報 |
-| Metadata | 4E | 🟢 低 | 追加メタデータ |
+| Color + Depth | 現行 | ✅ 完了 | 最も基本的なRGB-D機能 |
+| IMU (Accel/Gyro) | 現行 | ✅ 完了 | SLAM/VIO に必須 |
+| TF / Device / Sensor / Options | 現行 | ✅ 完了 | 再生時の周辺情報 |
+| IR (Infrared) | 今後 | 🟡 中 | ステレオマッチングに有用 |
+| per-frame Metadata | 今後 | 🟢 低 | 追加メタデータ |
 
 ---
 
 ## VRS APIの使用方法
 
-### pyvrs_writer (書き込み)
+### 公式 PyVRS writer adapter (書き込み)
 
 ```python
-from pyvrs_writer import VRSWriter
+from scripts.vrs_writer import VRSWriter
 
 # VRSファイルを開く
-with VRSWriter("output.vrs") as writer:
+with VRSWriter("output.vrs", compression="lz4") as writer:
     # ストリームを追加
     writer.add_stream(1001, "RealSense_Color")
 
@@ -566,7 +504,12 @@ for record in reader.records():
         metadata = record.metadata_blocks[0] if record.metadata_blocks else {}
 
         # カスタムブロック（画像データなど）を取得
-        data = record.custom_blocks[0] if record.custom_blocks else b''
+        if record.image_blocks:
+            data = record.image_blocks[0].tobytes()
+        elif record.custom_blocks:
+            data = record.custom_blocks[0]
+        else:
+            data = b""
 ```
 
 ---
@@ -576,7 +519,7 @@ for record in reader.records():
 ### 1. rosbags API の変更
 
 - **rosbags 0.9.x以前**: `Reader.deserialize()` メソッドが存在
-- **rosbags 0.11.0**: `AnyReader.deserialize()` に変更
+- **rosbags 0.11.3**: `AnyReader.deserialize()` を使用
 - **対応**: `scripts/rosbag_to_vrs_converter.py` で `AnyReader` を使用
 
 ### 2. CameraInfo 属性名の大文字化
@@ -585,11 +528,11 @@ for record in reader.records():
 - **rosbags デシリアライズ後**: `camera_info.K`, `camera_info.D` (大文字のまま)
 - **注意**: 小文字 `k`, `d` ではアクセスできない
 
-### 3. VRS RecordFormat の制限
+### 3. 公式 PyVRS writer adapter の制限
 
-- **現状**: pyvrs_writer では RecordFormat 未対応
-- **影響**: Data レコードに構造化されたメタデータを埋め込めない
-- **対処**: Configuration レコードにメタデータを集約
+- **現状**: PyPI `vrs==1.2.2` の writer module は direct import 時に `RecordFormat` export 欠落で失敗するため、`scripts.vrs_writer.load_official_writer_backend()` で必要な native symbols と旧 compression alias を補正している。
+- **Recordable type**: 公式 writer は汎用 recordable writer ではなく登録済み factory のみを作成できる。本リポジトリでは `sample_with_image` factory を使い、logical stream id/config は stream tags、payload は image block に保存する compatibility encoding を採用している。
+- **影響**: `scripts.vrs_reader.VRSReader` では stream id、configuration、timestamp、payload を roundtrip できるが、外部 VRS consumer 向けの意味論的 recordable 型は未保証。
 
 ---
 
@@ -602,27 +545,24 @@ for record in reader.records():
 | Color Image + K/D | ✅ 完了 | `rosbag_to_vrs_converter.py:211` |
 | Depth Image + K/D + depth_scale | ✅ 完了 | `rosbag_to_vrs_converter.py:234` |
 | ROSbag同等の情報再生 | ✅ 達成 | Configuration レコードに保存 |
-| IMU (Accel/Gyro) | ⏳ Phase 4B | 未実装（ロードマップあり） |
-| IR (Infrared) | ⏳ Phase 4C | 未実装（ロードマップあり） |
+| IMU (Accel/Gyro) | ✅ 完了 | `create_rgbd_imu_config()` |
+| Transform / Device / Sensor / Options | ✅ 完了 | `create_rgbd_imu_config()` |
+| IR (Infrared) | 今後 | ロードマップあり |
 
-### pyvrs経由でのRGB-D-IR + IMU読み込み
+### pyvrs経由でのRGB-D + IMU読み込み
 
 **現状:**
 - ✅ RGB: 読み込み可能（PyVRS経由）
 - ✅ Depth: 読み込み可能（PyVRS経由）
-- ❌ IR: 未実装（VRSファイルに保存されていない）
-- ❌ IMU: 未実装（VRSファイルに保存されていない）
+- ✅ IMU: 読み込み可能（PyVRS経由）
+- ✅ Transform / Device / Sensor / Options: configuration として読み込み可能
+- 未対応: IR と per-frame metadata は VRSファイルに保存されていない
 
-**実装のために必要な構造:**
-1. IMU/IRストリームの追加（`create_phase_4b_config`, `create_phase_4c_config`）
-2. Configuration レコード作成関数（`_write_imu_*_configuration`, `_write_ir_configuration`）
-3. Data レコード処理関数（`_process_imu_*_message`, `_process_ir_message`）
-4. `_process_messages()` での分岐処理追加
-
-詳細は本ドキュメントの「未実装機能と実装ロードマップ」セクションを参照してください。
+詳細は本ドキュメントの「未対応機能とロードマップ」セクションを参照してください。
 
 ---
 
 **作成日:** 2025-11-19
 **作成者:** Claude (Sonnet 4.5)
-**バージョン:** 1.0.0
+**更新日:** 2026-07-08
+**バージョン:** 1.1.0

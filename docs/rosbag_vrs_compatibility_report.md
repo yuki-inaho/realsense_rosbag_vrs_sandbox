@@ -5,6 +5,8 @@
 **検証フェーズ**: Phase 1-4 (VRS読み取り検証 + ROSbag構造分析 + マッピング設計)
 **作成者**: Claude (Sonnet 4.5)
 
+> 注記: このレポートは 2025-11-19 時点の履歴資料です。現行実装では自作 C++ writer / VRS submodule は削除済みで、書き込みは `scripts/vrs_writer.py` の公式 PyVRS writer adapter を使います。
+
 ---
 
 ## エグゼクティブサマリー
@@ -38,7 +40,7 @@
 - **対象センサー**: RealSense D435i (RGB Camera, Depth Camera, IMU Accel, IMU Gyro)
 - **対象ROSbagトピック**: 6トピック (Color/Depth画像、CameraInfo×2、IMU Accel/Gyro)
 - **対象VRSストリーム**: 4ストリーム (Color 1001, Depth 1002, IMU Accel 2001, IMU Gyro 2002)
-- **実装手法**: C++ VRS API + pybind11 Python bindings
+- **現行実装手法**: 公式 PyVRS writer adapter
 
 ### 1.3 検証期間
 
@@ -252,7 +254,7 @@ createRecord(
     DataSource(dataLayout_, {pixels.data(), pixels.size()}));
 ```
 
-**参考**: `third/vrs/sample_code/SampleRecordFormatDataLayout.cpp`
+**参考**: upstream VRS sample code の `SampleRecordFormatDataLayout.cpp`（このリポジトリには vendoring しない）
 
 ---
 
@@ -276,18 +278,11 @@ createRecord(
 **実装対象**: Stream 1001 (Color) + Stream 1002 (Depth)
 
 **実装ステップ**:
-1. C++実装: `pyvrs_writer/src/vrs_writer.cpp` に以下を追加
-   - `ColorImageConfigLayout` / `ColorImageDataLayout`
-   - `DepthImageConfigLayout` / `DepthImageDataLayout`
-   - `ColorCameraRecordable` / `DepthCameraRecordable` クラス
+1. 現行実装: `scripts/vrs_writer.py` の公式 PyVRS writer adapter を使う
+   - converter-facing API は `add_stream` / `write_configuration` / `write_data`
+   - configuration は stream tag、payload は image block として保存する
 
-2. Python Binding: pybind11でPython側から使用可能にする
-   ```cpp
-   py::class_<ColorCameraRecordable>(m, "ColorCameraRecordable")
-       .def(py::init<>())
-       .def("add_configuration_record", ...)
-       .def("add_data_record", ...);
-   ```
+2. 拡張判断: 外部 VRS consumer 向けの意味論的 recordable 型が必要になった場合のみ、公式 PyVRS / VRS API で追加実装する
 
 3. ROSbag変換スクリプト: `scripts/convert_rosbag_to_vrs.py` 作成
    - `rosbags-py`でROSbagを読み取り

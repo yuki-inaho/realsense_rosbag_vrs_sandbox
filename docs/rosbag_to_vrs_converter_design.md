@@ -10,7 +10,7 @@
 
 ```
 1. ROSbagファイルを開く（rosbags-py使用）
-2. VRSファイルを作成（pyvrs_writer使用）
+2. VRSファイルを作成（公式 PyVRS writer adapter 使用）
 3. マッピング仕様に基づいてストリームを作成
 4. 各ストリームのConfigurationレコードを書き込み
 5. 全メッセージを時系列順に読み込み、対応するVRSストリームにDataレコードとして書き込み

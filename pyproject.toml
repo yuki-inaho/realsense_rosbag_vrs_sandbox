@@ -5,19 +5,11 @@ description = "RealSense ROS bag data extraction tool"
 readme = "README.md"
 requires-python = ">=3.10.6"
 dependencies = [
-    "pyrealsense2>=2.50.0",
-    "rosbags>=0.9.0",
-    "numpy>=1.24.0",
-    "opencv-python>=4.8.0",
-    "vrs>=1.2.1",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-    "mypy>=1.5.0",
-    "ruff>=0.1.0",
+    "pyrealsense2>=2.58.2.10647",
+    "rosbags>=0.11.3",
+    "numpy>=1.24.0,<2.3",
+    "opencv-python>=5.0.0.93",
+    "vrs>=1.2.2",
 ]
 
 [tool.ruff]
@@ -33,15 +25,38 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=scripts --cov-report=term-missing"
+markers = [
+    "integration: requires a real RealSense ROSbag file",
+    "slow: long-running conversion checks",
+]
 
 [tool.mypy]
 python_version = "3.10"
+explicit_package_bases = true
+no_site_packages = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 strict = true
 
+[[tool.mypy.overrides]]
+module = [
+    "numpy",
+    "pyvrs",
+    "pyvrs.*",
+    "rosbags.*",
+    "vrsbindings",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true
+
 [dependency-groups]
 dev = [
-    "pytest-cov>=7.0.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "mypy>=2.2.0",
+    "ruff>=0.15.20",
 ]

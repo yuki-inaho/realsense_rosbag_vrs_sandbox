@@ -1,68 +1,80 @@
-"""VRS Writer module for creating VRS files from sensor data.
+"""VRS writer adapter backed by the official PyVRS writer package.
 
-This module provides a Pythonic interface to the pyvrs_writer C++ bindings,
-which wrap the VRS C++ library's RecordFileWriter class.
+The public API keeps the repository's converter-facing writer contract:
+``add_stream()``, ``write_configuration()``, ``write_data()``, ``close()``,
+and ``is_open()``.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-try:
-    import pyvrs_writer
-except ImportError as e:
-    raise ImportError(
-        "pyvrs_writer module not found. "
-        "Please build and install pyvrs_writer from pyvrs_writer/ directory."
-    ) from e
+import numpy as np
+
+_OFFICIAL_STREAM_FACTORY = "sample_with_image"
+_USER_STREAM_ID_TAG = "user_stream_id"
+_USER_STREAM_NAME_TAG = "user_stream_name"
+_CONFIG_JSON_TAG = "config_json"
+
+
+def load_official_writer_backend() -> tuple[str, type[Any], Any]:
+    """Load the official PyVRS writer, patching v1.2.2 export gaps.
+
+    The vrs 1.2.2 wheel ships ``pyvrs.writer`` but does not re-export a few
+    native binding symbols from ``pyvrs.__init__``. It also uses the old
+    ``CompressionPreset.Zmedium`` enum name. Patch those names before import so
+    the official writer module can be used without modifying site-packages.
+    """
+    import pyvrs
+    import vrsbindings
+
+    for name in ("RecordFormat", "Stream", "Writer"):
+        if not hasattr(pyvrs, name):
+            setattr(pyvrs, name, getattr(vrsbindings, name))
+
+    if not hasattr(pyvrs.CompressionPreset, "Zmedium"):
+        pyvrs.CompressionPreset.Zmedium = pyvrs.CompressionPreset.ZSTD_MEDIUM
+
+    from pyvrs.writer import VRSWriter as OfficialVRSWriter
+
+    return "pyvrs.writer.VRSWriter", OfficialVRSWriter, pyvrs
+
+
+@dataclass
+class _StreamState:
+    name: str
+    stream: Any | None = None
+    config_data: dict[str, Any] | None = None
+    config_record_written: bool = False
+    payload_width: int | None = None
 
 
 class VRSWriter:
-    """VRS file writer with Pythonic interface and context manager support.
+    """VRS file writer with the repository's historical writer API."""
 
-    This class wraps the pyvrs_writer C++ bindings to provide a simple
-    interface for creating VRS files and writing sensor data.
+    backend_name = "pyvrs.writer.VRSWriter"
 
-    Example:
-        >>> with VRSWriter("output.vrs") as writer:
-        ...     writer.add_stream(1001, "RGB Camera")
-        ...     writer.write_configuration(1001, {"width": 640, "height": 480})
-        ...     writer.write_data(1001, 0.0, b"image_data")
-    """
-
-    def __init__(self, filepath: Path | str) -> None:
-        """Initialize VRS writer and create VRS file.
-
-        Args:
-            filepath: Path to the VRS file to create (Path or str)
-
-        Raises:
-            ValueError: If filepath is invalid
-            RuntimeError: If VRS file creation fails
-        """
+    def __init__(self, filepath: Path | str, compression: str = "lz4") -> None:
         if isinstance(filepath, str):
             filepath = Path(filepath)
 
         if not isinstance(filepath, Path):
             raise ValueError(f"filepath must be Path or str, got {type(filepath).__name__}")
 
+        self._backend_name, writer_cls, self._pyvrs = load_official_writer_backend()
+        self.backend_name = self._backend_name
         self._filepath = filepath
-        self._writer: Any = None  # pyvrs_writer.VRSWriter instance
-        self._stream_ids: set[int] = set()  # Track added stream IDs
-
-        try:
-            self._writer = pyvrs_writer.VRSWriter(str(filepath))  # type: ignore[attr-defined]
-        except Exception as e:
-            raise RuntimeError(f"Failed to create VRS file '{filepath}': {e}") from e
+        self._writer = writer_cls(str(filepath))
+        self._compression_preset = self._resolve_compression(compression)
+        self._stream_states: dict[int, _StreamState] = {}
+        self._max_record_timestamp = 0.0
+        self._has_pending_records = False
+        self._closed = False
 
     def __enter__(self) -> VRSWriter:
-        """Context manager entry.
-
-        Returns:
-            self
-        """
         return self
 
     def __exit__(
@@ -71,110 +83,44 @@ class VRSWriter:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        """Context manager exit. Automatically closes the file.
-
-        Args:
-            exc_type: Exception type (if any)
-            exc_val: Exception value (if any)
-            exc_tb: Exception traceback (if any)
-        """
         self.close()
 
     def add_stream(self, stream_id: int, stream_name: str) -> None:
-        """Add a new stream to the VRS file.
-
-        Args:
-            stream_id: Unique stream identifier (positive integer)
-            stream_name: Human-readable stream name
-
-        Raises:
-            ValueError: If stream_id is invalid or already exists
-            RuntimeError: If VRS file is not open or stream addition fails
-        """
-        if not self.is_open():
-            raise RuntimeError("VRS file is not open")
-
-        if not isinstance(stream_id, int) or stream_id <= 0:
-            raise ValueError(f"stream_id must be a positive integer, got {stream_id}")
+        """Register a logical stream id and name."""
+        self._validate_open()
+        self._validate_stream_id(stream_id)
 
         if not isinstance(stream_name, str):
             raise ValueError(f"stream_name must be str, got {type(stream_name).__name__}")
 
-        # Check for duplicate stream ID
-        if stream_id in self._stream_ids:
+        if stream_id in self._stream_states:
             raise ValueError(f"Stream ID {stream_id} already exists. Stream IDs must be unique.")
 
-        try:
-            assert self._writer is not None
-            # Encode stream_id in stream_name (flavor) for later retrieval by VRSReader
-            # Format: "stream_name|id:stream_id"
-            encoded_name = f"{stream_name}|id:{stream_id}"
-            self._writer.add_stream(stream_id, encoded_name)
-            self._stream_ids.add(stream_id)  # Track successfully added stream
-        except Exception as e:
-            raise RuntimeError(f"Failed to add stream {stream_id} '{stream_name}': {e}") from e
+        self._stream_states[stream_id] = _StreamState(name=self._logical_stream_name(stream_name))
 
     def write_configuration(self, stream_id: int, config_data: dict[str, Any]) -> None:
-        """Write a Configuration record for the specified stream.
-
-        Configuration records should be written once per stream after add_stream().
-
-        Args:
-            stream_id: Target stream ID
-            config_data: Configuration parameters as JSON-serializable dictionary
-
-        Raises:
-            ValueError: If stream_id doesn't exist or config_data is not serializable
-            RuntimeError: If VRS file is not open or write fails
-        """
-        if not self.is_open():
-            raise RuntimeError("VRS file is not open")
-
-        if not isinstance(stream_id, int) or stream_id <= 0:
-            raise ValueError(f"stream_id must be a positive integer, got {stream_id}")
-
-        # Check if stream ID exists
-        if stream_id not in self._stream_ids:
-            raise ValueError(f"Stream ID {stream_id} does not exist. Call add_stream() first.")
+        """Write a Configuration record and persist the original config as a stream tag."""
+        self._validate_open()
+        self._validate_stream_id(stream_id)
 
         if not isinstance(config_data, dict):
             raise ValueError(f"config_data must be dict, got {type(config_data).__name__}")
 
-        try:
-            config_json = json.dumps(config_data)
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"config_data is not JSON-serializable: {e}") from e
+        state = self._state_for(stream_id)
+        if state.config_record_written:
+            raise ValueError(f"Configuration for stream {stream_id} has already been written.")
 
         try:
-            assert self._writer is not None
-            self._writer.write_configuration(stream_id, config_json)
-        except Exception as e:
-            raise RuntimeError(f"Failed to write configuration for stream {stream_id}: {e}") from e
+            json.dumps(config_data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"config_data is not JSON-serializable: {exc}") from exc
+
+        state.config_data = config_data
 
     def write_data(self, stream_id: int, timestamp: float, data: bytes | list[int]) -> None:
-        """Write a Data record for the specified stream.
-
-        Data records can be written multiple times per stream with increasing
-        timestamps.
-
-        Args:
-            stream_id: Target stream ID
-            timestamp: Timestamp in seconds (relative to recording start)
-            data: Data payload as bytes or list of integers (0-255)
-
-        Raises:
-            ValueError: If stream_id doesn't exist, timestamp is negative, or data is empty
-            RuntimeError: If VRS file is not open or write fails
-        """
-        if not self.is_open():
-            raise RuntimeError("VRS file is not open")
-
-        if not isinstance(stream_id, int) or stream_id <= 0:
-            raise ValueError(f"stream_id must be a positive integer, got {stream_id}")
-
-        # Check if stream ID exists
-        if stream_id not in self._stream_ids:
-            raise ValueError(f"Stream ID {stream_id} does not exist. Call add_stream() first.")
+        """Write a Data record for the specified stream."""
+        self._validate_open()
+        self._validate_stream_id(stream_id)
 
         if not isinstance(timestamp, (int, float)):
             raise ValueError(f"timestamp must be numeric, got {type(timestamp).__name__}")
@@ -182,49 +128,123 @@ class VRSWriter:
         if timestamp < 0:
             raise ValueError(f"timestamp must be non-negative, got {timestamp}")
 
-        # Convert bytes to list[int] if necessary (pyvrs_writer expects list[int])
         if isinstance(data, bytes):
-            data_list = list(data)
+            payload = data
         elif isinstance(data, list):
-            data_list = data
+            try:
+                payload = bytes(data)
+            except ValueError as exc:
+                raise ValueError("data list must contain integers in range 0-255") from exc
         else:
             raise ValueError(f"data must be bytes or list[int], got {type(data).__name__}")
 
-        if not data_list:
+        if not payload:
             raise ValueError("data must not be empty")
 
-        try:
-            assert self._writer is not None
-            self._writer.write_data(stream_id, float(timestamp), data_list)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to write data for stream {stream_id} at {timestamp}s: {e}"
-            ) from e
+        state = self._state_for(stream_id)
+        self._ensure_official_stream(stream_id)
+        if state.stream is None:
+            raise RuntimeError(f"stream {stream_id} was not initialized")
+        if not state.config_record_written:
+            state.config_data = state.config_data or {}
+            self._write_official_configuration(stream_id, payload_width=len(payload))
+        elif state.payload_width != len(payload):
+            self._write_official_configuration(
+                stream_id,
+                payload_width=len(payload),
+                timestamp=float(timestamp),
+            )
+
+        metadata = state.stream.get_data_record_metadata()
+        metadata["camera_id"] = int(stream_id)
+        metadata["room_temperature"] = 0.0
+        metadata["some_string"] = ""
+        metadata["some_string_int_map"] = {"payload_len": len(payload)}
+        metadata["doubles"] = [0.0, 0.0, 0.0]
+
+        payload_array = np.frombuffer(payload, dtype=np.uint8).copy()
+        state.stream.create_data_record(float(timestamp), metadata, payload_array)
+        self._max_record_timestamp = max(self._max_record_timestamp, float(timestamp))
+        self._has_pending_records = True
 
     def close(self) -> None:
-        """Close the VRS file.
-
-        This must be called to finalize the VRS file. Alternatively, use the
-        context manager (with statement) for automatic cleanup.
-
-        Raises:
-            RuntimeError: If close fails
-        """
-        if self._writer is not None and self.is_open():
-            try:
-                self._writer.close()
-            except Exception as e:
-                raise RuntimeError(f"Failed to close VRS file: {e}") from e
+        if not self._closed:
+            for stream_id, state in self._stream_states.items():
+                if state.config_data is not None and not state.config_record_written:
+                    self._ensure_official_stream(stream_id)
+                    self._write_official_configuration(stream_id, payload_width=1)
+            if self._has_pending_records:
+                self._writer.flush_records(self._max_record_timestamp)
+            else:
+                self._writer.flush_records(0.0)
+            self._writer.close()
+            self._closed = True
 
     def is_open(self) -> bool:
-        """Check if the VRS file is currently open.
+        return not self._closed
 
-        Returns:
-            True if the file is open, False otherwise
-        """
-        if self._writer is None:
-            return False
-        try:
-            return bool(self._writer.is_open())
-        except Exception:
-            return False
+    def _resolve_compression(self, compression: str) -> Any:
+        normalized = compression.lower()
+        presets = self._pyvrs.CompressionPreset
+        if normalized == "none":
+            return presets.NONE
+        if normalized == "lz4":
+            return presets.LZ4_FAST
+        if normalized == "zstd":
+            return presets.ZSTD_MEDIUM
+        raise ValueError(
+            f"Unsupported compression '{compression}'. Expected one of: none, lz4, zstd."
+        )
+
+    def _validate_open(self) -> None:
+        if not self.is_open():
+            raise RuntimeError("VRS file is not open")
+
+    @staticmethod
+    def _validate_stream_id(stream_id: int) -> None:
+        if not isinstance(stream_id, int) or stream_id <= 0:
+            raise ValueError(f"stream_id must be a positive integer, got {stream_id}")
+
+    @staticmethod
+    def _logical_stream_name(stream_name: str) -> str:
+        return stream_name.split("|id:", maxsplit=1)[0]
+
+    def _state_for(self, stream_id: int) -> _StreamState:
+        if stream_id not in self._stream_states:
+            raise ValueError(f"Stream ID {stream_id} does not exist. Call add_stream() first.")
+        return self._stream_states[stream_id]
+
+    def _ensure_official_stream(self, stream_id: int) -> None:
+        state = self._state_for(stream_id)
+        if state.stream is not None:
+            return
+
+        state.stream = self._writer.create_stream(
+            _OFFICIAL_STREAM_FACTORY,
+            compression=self._compression_preset,
+        )
+        state.stream.set_tag(_USER_STREAM_ID_TAG, str(stream_id))
+        state.stream.set_tag(_USER_STREAM_NAME_TAG, state.name)
+        state.stream.set_tag(
+            _CONFIG_JSON_TAG,
+            json.dumps(state.config_data or {}, separators=(",", ":"), sort_keys=True),
+        )
+
+    def _write_official_configuration(
+        self,
+        stream_id: int,
+        payload_width: int,
+        timestamp: float = 0.0,
+    ) -> None:
+        state = self._state_for(stream_id)
+        assert state.stream is not None
+
+        metadata = state.stream.get_config_record_metadata()
+        metadata["image_width"] = int(max(payload_width, 1))
+        metadata["image_height"] = 1
+        metadata["image_pixel_format"] = self._pyvrs.PixelFormat.GREY8.value
+        state.stream.create_config_record(timestamp, metadata)
+        state.payload_width = int(max(payload_width, 1))
+        state.config_record_written = True
+        self._max_record_timestamp = max(self._max_record_timestamp, timestamp)
+        self._has_pending_records = True

@@ -1,11 +1,12 @@
 """Tests for VRS Writer module.
 
 This module contains unit tests for the VRS Writer wrapper class,
-which provides a Pythonic interface to the pyvrs_writer C++ bindings.
+which provides the repository compatibility API over official PyVRS.
 """
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 def test_vrs_writer_initialization(tmp_path: Path) -> None:
@@ -58,7 +59,7 @@ def test_write_data(tmp_path: Path) -> None:
     vrs_file = tmp_path / "test.vrs"
     with VRSWriter(vrs_file) as writer:
         writer.add_stream(1001, "Test Stream")
-        # pyvrs_writerはlist[int]を期待するため、bytesをlistに変換
+        # bytes と list[int] の両方を受け付ける互換 API として検証する
         test_data = b"test data"
         writer.write_data(1001, 0.0, test_data)
         test_data2 = b"test data 2"

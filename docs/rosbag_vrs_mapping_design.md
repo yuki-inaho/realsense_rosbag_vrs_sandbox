@@ -319,7 +319,7 @@ private:
 
 - **検討事項**: ImageブロックとDataLayoutの組み合わせ方
 - **推奨方式**: DataLayout (metadata) + ImageBlock (pixel data)
-- **参考**: `third/vrs/sample_code/SampleRecordFormatDataLayout.cpp` の実装
+- **参考**: upstream VRS sample code の `SampleRecordFormatDataLayout.cpp`（このリポジトリには vendoring しない）
 
 ### タイムスタンプの扱い
 
@@ -339,10 +339,10 @@ private:
 
 ### Phase 4実装に向けて
 
-1. **C++実装**: `pyvrs_writer/src/vrs_writer.cpp` に上記DataLayoutクラスを追加
-2. **Python Binding**: pybind11でPython側から使用可能にする
-3. **ROSbag変換スクリプト**: `rosbags-py`でROSbagを読み、VRSに書き込む
-4. **テスト**: 変換したVRSファイルをC++ VRS Readerで読み取り、データ完全性を検証
+1. **現行 writer**: `scripts/vrs_writer.py` の公式 PyVRS writer adapter を使う
+2. **ROSbag変換スクリプト**: `rosbags-py`でROSbagを読み、VRSに書き込む
+3. **テスト**: repository reader と実 rosbag integration で roundtrip を検証する
+4. **将来課題**: 外部 VRS consumer 向けの意味論的 recordable 型が必要になった場合のみ、公式 API で拡張する
 
 ---
 

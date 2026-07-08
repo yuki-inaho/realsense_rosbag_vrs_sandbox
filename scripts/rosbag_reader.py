@@ -4,8 +4,9 @@ This module provides a clean interface for reading ROS bag files using the rosba
 Follows the Single Responsibility Principle (SRP) by focusing solely on bag file I/O.
 """
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, cast
 
 from rosbags.rosbag1 import Reader
 
@@ -95,7 +96,7 @@ class RosbagReader:
             Duration in seconds
         """
         reader = self._get_reader()
-        return reader.duration / 1e9  # Convert nanoseconds to seconds
+        return cast(float, reader.duration / 1e9)  # Convert nanoseconds to seconds
 
     def get_message_count(self, topic: str) -> int:
         """Get the number of messages for a specific topic.
@@ -109,7 +110,7 @@ class RosbagReader:
         reader = self._get_reader()
         for conn in reader.connections:
             if conn.topic == topic:
-                return conn.msgcount
+                return cast(int, conn.msgcount)
         return 0
 
     def filter_topics(self, pattern: str) -> list[str]:

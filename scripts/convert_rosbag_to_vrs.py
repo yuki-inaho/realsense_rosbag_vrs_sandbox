@@ -2,14 +2,15 @@
 """
 CLI tool for converting RealSense D435i ROSbag files to VRS format.
 
-Phase 4A: Color + Depth streams (必須)
+Legacy RGB-D profile: Color + Depth streams
 
 Usage:
     python scripts/convert_rosbag_to_vrs.py input.bag output.vrs
     python scripts/convert_rosbag_to_vrs.py input.bag output.vrs --verbose
 """
-import sys
+
 import argparse
+import sys
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -17,14 +18,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.rosbag_to_vrs_converter import (  # noqa: E402
     RosbagToVRSConverter,
-    create_phase_4a_config,
+    create_rgbd_config,
 )
 
 
 def main() -> int:
     """Main entry point for ROSbag to VRS conversion CLI"""
     parser = argparse.ArgumentParser(
-        description="Convert RealSense D435i ROSbag to VRS format (Phase 4A: Color + Depth)",
+        description="Convert RealSense D435i ROSbag to VRS format (legacy RGB-D profile)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -37,11 +38,11 @@ Examples:
   # Specify compression (lz4 or zstd)
   python scripts/convert_rosbag_to_vrs.py data/rosbag/sample.bag output.vrs --compression zstd
 
-Phase 4A streams:
+Legacy RGB-D profile streams:
   - Stream 1001: Color Image (RGB, 1920x1080)
   - Stream 1002: Depth Image (16UC1, 1280x720)
 
-Note: Phase 4B (IMU) and Phase 4C (TF, metadata) are not yet implemented.
+For IMU and metadata-capable conversion, use root `convert_to_vrs.py --imu`.
         """,
     )
 
@@ -86,7 +87,7 @@ Note: Phase 4B (IMU) and Phase 4C (TF, metadata) are not yet implemented.
             print(f"Created output directory: {output_dir}")
 
     # Create converter configuration
-    config = create_phase_4a_config(
+    config = create_rgbd_config(
         compression=args.compression,
         verbose=args.verbose,
     )
@@ -101,14 +102,14 @@ Note: Phase 4B (IMU) and Phase 4C (TF, metadata) are not yet implemented.
 
         if args.verbose:
             print(f"Converting {args.input_bag} -> {args.output_vrs}")
-            print(f"Configuration: Phase 4A (Color + Depth)")
+            print("Configuration: legacy RGB-D profile (Color + Depth)")
             print(f"Compression: {args.compression}")
             print("-" * 60)
 
         result = converter.convert()
 
         # Print summary
-        print(f"\nConversion complete!")
+        print("\nConversion complete!")
         print(f"  Input:  {result.input_bag_size / 1024 / 1024:.2f} MB")
         print(f"  Output: {result.output_vrs_size / 1024 / 1024:.2f} MB")
         print(f"  Compression ratio: {result.compression_ratio:.2%}")

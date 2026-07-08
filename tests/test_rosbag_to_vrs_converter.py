@@ -3,16 +3,18 @@ Test cases for ROSbag to VRS Converter (Phase 4A: Color + Depth)
 
 TDD RED Phase: Test cases created before implementation.
 """
-import pytest
-from pathlib import Path
+
 from dataclasses import dataclass
-from typing import Dict
+from pathlib import Path
+
+import pytest
 
 
 # Data classes (must be imported from actual implementation later)
 @dataclass
 class StreamConfig:
     """Stream configuration"""
+
     stream_id: int
     stream_type: str  # "color", "depth", "imu_accel", "imu_gyro"
     recordable_type_id: str  # "ForwardCamera", "MotionSensor"
@@ -22,7 +24,8 @@ class StreamConfig:
 @dataclass
 class ConverterConfig:
     """Converter configuration"""
-    topic_mapping: Dict[str, StreamConfig]
+
+    topic_mapping: dict[str, StreamConfig]
     phase: str  # "4A", "4B", "4C"
     compression: str = "lz4"
     verbose: bool = False
@@ -31,31 +34,32 @@ class ConverterConfig:
 @dataclass
 class ConversionResult:
     """Conversion result statistics"""
+
     input_bag_size: int  # bytes
     output_vrs_size: int  # bytes
     compression_ratio: float
     total_messages: int
-    messages_per_stream: Dict[int, int]  # stream_id -> count
+    messages_per_stream: dict[int, int]  # stream_id -> count
     duration_sec: float
     conversion_time_sec: float
 
 
 # Fixtures
 @pytest.fixture
-def phase_4a_mapping() -> Dict[str, StreamConfig]:
+def phase_4a_mapping() -> dict[str, StreamConfig]:
     """Phase 4A topic mapping (Color + Depth only)"""
     return {
         "/device_0/sensor_1/Color_0/image/data": StreamConfig(
             stream_id=1001,
             stream_type="color",
             recordable_type_id="ForwardCamera",
-            flavor="RealSense_D435i_Color|id:1001"
+            flavor="RealSense_D435i_Color|id:1001",
         ),
         "/device_0/sensor_0/Depth_0/image/data": StreamConfig(
             stream_id=1002,
             stream_type="depth",
             recordable_type_id="ForwardCamera",
-            flavor="RealSense_D435i_Depth|id:1002"
+            flavor="RealSense_D435i_Depth|id:1002",
         ),
     }
 
@@ -64,10 +68,7 @@ def phase_4a_mapping() -> Dict[str, StreamConfig]:
 def phase_4a_config(phase_4a_mapping) -> ConverterConfig:
     """Phase 4A converter configuration"""
     return ConverterConfig(
-        topic_mapping=phase_4a_mapping,
-        phase="4A",
-        compression="lz4",
-        verbose=False
+        topic_mapping=phase_4a_mapping, phase="4A", compression="lz4", verbose=False
     )
 
 

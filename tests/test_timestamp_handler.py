@@ -1,7 +1,8 @@
 """Tests for timestamp handling functionality."""
 
-import pytest
 from datetime import datetime, timezone
+
+import pytest
 
 
 class TestTimestampHandler:

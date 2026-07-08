@@ -3,8 +3,6 @@
 This test verifies that PyVRS can be imported successfully.
 """
 
-import pytest
-
 
 def test_pyvrs_import() -> None:
     """Test that pyvrs module can be imported."""

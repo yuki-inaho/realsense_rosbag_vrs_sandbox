@@ -7,15 +7,14 @@ which reads VRS (Virtual Reality Stream) files created by Meta.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, cast
 
 try:
     import pyvrs
 except ImportError as e:
-    raise ImportError(
-        "pyvrs module not found. Please install with: uv add vrs"
-    ) from e
+    raise ImportError("pyvrs module not found. Please install with: uv add vrs") from e
 
 
 class VRSReader:
@@ -47,9 +46,7 @@ class VRSReader:
             filepath = Path(filepath)
 
         if not isinstance(filepath, Path):
-            raise ValueError(
-                f"filepath must be Path or str, got {type(filepath).__name__}"
-            )
+            raise ValueError(f"filepath must be Path or str, got {type(filepath).__name__}")
 
         if not filepath.exists():
             raise FileNotFoundError(f"VRS file not found: {filepath}")
@@ -63,13 +60,16 @@ class VRSReader:
             # Cache stream ID mapping at initialization (no iteration required)
             for vrs_stream_id in self._reader.stream_ids:
                 info = self._reader.get_stream_info(vrs_stream_id)
-                flavor = info.get("flavor", "")
-                if "|id:" in flavor:
+                user_id = self._get_tagged_user_stream_id(vrs_stream_id)
+                if user_id is None:
+                    user_id = self._parse_user_stream_id(info.get("flavor", ""))
+                if user_id is None and "-" in vrs_stream_id:
                     try:
-                        user_id = int(flavor.split("|id:")[-1])
-                        self._stream_id_mapping[user_id] = vrs_stream_id
+                        user_id = int(vrs_stream_id.split("-")[-1])
                     except ValueError:
-                        pass
+                        user_id = None
+                if user_id is not None:
+                    self._stream_id_mapping[user_id] = vrs_stream_id
         except Exception as e:
             raise RuntimeError(f"Failed to open VRS file '{filepath}': {e}") from e
 
@@ -111,27 +111,7 @@ class VRSReader:
             raise RuntimeError("VRS file is not open")
 
         try:
-            stream_ids = []
-            for vrs_stream_id in self._reader.stream_ids:
-                info = self._reader.get_stream_info(vrs_stream_id)
-                flavor = info.get("flavor", "")
-
-                # Extract user stream_id from flavor
-                # Format: "stream_name|id:stream_id"
-                if "|id:" in flavor:
-                    try:
-                        user_stream_id = int(flavor.split("|id:")[-1])
-                        stream_ids.append(user_stream_id)
-                    except ValueError:
-                        # Fallback: use VRS instance ID
-                        if "-" in vrs_stream_id:
-                            stream_ids.append(int(vrs_stream_id.split("-")[-1]))
-                else:
-                    # No encoded ID, use VRS instance ID
-                    if "-" in vrs_stream_id:
-                        stream_ids.append(int(vrs_stream_id.split("-")[-1]))
-
-            return sorted(stream_ids)
+            return sorted(self._stream_id_mapping)
         except Exception as e:
             raise RuntimeError(f"Failed to get stream IDs: {e}") from e
 
@@ -151,6 +131,38 @@ class VRSReader:
             return self._stream_id_mapping[user_stream_id]
 
         raise ValueError(f"Stream ID {user_stream_id} not found")
+
+    @staticmethod
+    def _parse_user_stream_id(flavor: str) -> int | None:
+        """Extract ``|id:1001`` from a stream flavor."""
+        if "|id:" not in flavor:
+            return None
+        suffix = flavor.split("|id:", maxsplit=1)[1]
+        value = suffix.split("|", maxsplit=1)[0]
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    def _stream_tags(self, vrs_stream_id: str) -> dict[str, str]:
+        if self._reader is None:
+            return {}
+        tags = getattr(self._reader, "stream_tags", {})
+        if isinstance(tags, dict):
+            stream_tags = tags.get(vrs_stream_id, {})
+            if isinstance(stream_tags, dict):
+                return stream_tags
+        return {}
+
+    def _get_tagged_user_stream_id(self, vrs_stream_id: str) -> int | None:
+        tags = self._stream_tags(vrs_stream_id)
+        value = tags.get("user_stream_id")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     def read_configuration(self, stream_id: int) -> dict[str, Any]:
         """Read configuration record for the specified stream.
@@ -174,6 +186,12 @@ class VRSReader:
         try:
             # Convert user stream_id to VRS stream_id
             vrs_stream_id = self._get_vrs_stream_id(stream_id)
+            tags = self._stream_tags(vrs_stream_id)
+            if "config_json" in tags:
+                try:
+                    return cast(dict[str, Any], json.loads(tags["config_json"]))
+                except json.JSONDecodeError:
+                    return {"config_json": tags["config_json"]}
 
             # Iterate through all records and find configuration for the stream
             for record in self._reader:
@@ -187,13 +205,13 @@ class VRSReader:
                             config_json_str = metadata["config_json"]
                             try:
                                 # Try to decode as JSON
-                                return json.loads(config_json_str)
+                                return cast(dict[str, Any], json.loads(config_json_str))
                             except json.JSONDecodeError:
                                 # Return as string if not valid JSON
                                 return {"config_json": config_json_str}
                         else:
                             # Return metadata directly if no config_json field
-                            return metadata
+                            return cast(dict[str, Any], metadata)
                     else:
                         # No metadata blocks, return empty dict
                         return {}
@@ -203,9 +221,7 @@ class VRSReader:
         except ValueError:
             raise
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to read configuration for stream {stream_id}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to read configuration for stream {stream_id}: {e}") from e
 
     def read_data_records(self, stream_id: int) -> Iterator[dict[str, Any]]:
         """Read all data records for the specified stream.
@@ -240,9 +256,24 @@ class VRSReader:
                         custom_block = record.custom_blocks[0]
                         if isinstance(custom_block, bytes):
                             data = custom_block
-                        elif hasattr(custom_block, 'data'):
+                        elif hasattr(custom_block, "data"):
                             data = custom_block.data
                         # Otherwise, data remains empty bytes
+                    elif getattr(record, "n_image_blocks", 0) > 0:
+                        image_block = record.image_blocks[0]
+                        if hasattr(image_block, "tobytes"):
+                            data = image_block.tobytes()
+                        elif hasattr(image_block, "data"):
+                            data = bytes(image_block.data)
+
+                        if record.n_metadata_blocks > 0:
+                            payload_len = (
+                                record.metadata_blocks[0]
+                                .get("some_string_int_map", {})
+                                .get("payload_len")
+                            )
+                            if isinstance(payload_len, int):
+                                data = data[:payload_len]
 
                     yield {
                         "timestamp": record.timestamp,
@@ -251,9 +282,7 @@ class VRSReader:
         except ValueError:
             raise
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to read data records for stream {stream_id}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to read data records for stream {stream_id}: {e}") from e
 
     def get_record_count(self, stream_id: int) -> int:
         """Get the number of data records for the specified stream.
@@ -282,9 +311,7 @@ class VRSReader:
                     count += 1
             return count
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to count records for stream {stream_id}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to count records for stream {stream_id}: {e}") from e
 
     def close(self) -> None:
         """Close the VRS file.

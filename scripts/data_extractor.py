@@ -6,12 +6,11 @@ Responsibility Principle (SRP) by focusing on data extraction and transformation
 """
 
 from typing import Any
+
 import numpy as np
-from datetime import datetime
-import struct
+from rosbags.typesys import Stores, get_typestore
 
-from rosbags.typesys import get_typestore, Stores
-
+from scripts.rosbag_deserializer import deserialize_ros1_lenient
 from scripts.timestamp_handler import ros_timestamp_to_datetime
 
 
@@ -56,9 +55,14 @@ class DataExtractor:
         if "Image" not in msgtype:
             raise ValueError(f"Expected Image message type, got {msgtype}")
 
+        msg = deserialize_ros1_lenient(self.typestore, rawdata, msgtype)
+
         result: dict[str, Any] = {
             "rawdata": rawdata,
             "msgtype": msgtype,
+            "width": int(msg.width),
+            "height": int(msg.height),
+            "encoding": str(msg.encoding),
         }
 
         # Add timestamp if provided
@@ -67,11 +71,7 @@ class DataExtractor:
         else:
             result["timestamp"] = None
 
-        # Add placeholder fields for compatibility with tests
-        result["width"] = 0
-        result["height"] = 0
-        result["encoding"] = "unknown"
-        result["data"] = np.array([])
+        result["data"] = self._image_array(msg)
 
         return result
 
@@ -101,16 +101,18 @@ class DataExtractor:
         if "Imu" not in msgtype:
             raise ValueError(f"Expected Imu message type, got {msgtype}")
 
+        msg = deserialize_ros1_lenient(self.typestore, rawdata, msgtype)
+
         result: dict[str, Any] = {
             "angular_velocity": {
-                "x": 0.0,
-                "y": 0.0,
-                "z": 0.0,
+                "x": float(msg.angular_velocity.x),
+                "y": float(msg.angular_velocity.y),
+                "z": float(msg.angular_velocity.z),
             },
             "linear_acceleration": {
-                "x": 0.0,
-                "y": 0.0,
-                "z": 0.0,
+                "x": float(msg.linear_acceleration.x),
+                "y": float(msg.linear_acceleration.y),
+                "z": float(msg.linear_acceleration.z),
             },
             "rawdata": rawdata,
             "msgtype": msgtype,
@@ -123,3 +125,34 @@ class DataExtractor:
             result["timestamp"] = None
 
         return result
+
+    @staticmethod
+    def _image_array(msg: Any) -> np.ndarray[Any, Any]:
+        data = np.asarray(msg.data, dtype=np.uint8)
+        height = int(msg.height)
+        width = int(msg.width)
+        encoding = str(msg.encoding).lower()
+        step = int(msg.step)
+
+        if encoding in {"16uc1", "mono16", "z16"}:
+            dtype = ">u2" if int(msg.is_bigendian) else "<u2"
+            row_bytes = width * np.dtype(dtype).itemsize
+            rows = np.frombuffer(data.tobytes(), dtype=np.uint8).reshape(height, step)
+            values = np.frombuffer(rows[:, :row_bytes].tobytes(), dtype=dtype)
+            return values.astype(np.uint16, copy=False).reshape(height, width)
+
+        if encoding in {"rgb8", "bgr8"}:
+            channels = 3
+        elif encoding in {"rgba8", "bgra8"}:
+            channels = 4
+        elif encoding in {"mono8", "8uc1"}:
+            channels = 1
+        else:
+            channels = max(1, step // width) if width else 1
+
+        row_bytes = width * channels
+        rows = data.reshape(height, step)
+        image = rows[:, :row_bytes].reshape(height, width, channels)
+        if channels == 1:
+            return image[:, :, 0]
+        return image

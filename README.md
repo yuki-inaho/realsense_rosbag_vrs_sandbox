@@ -1,6 +1,6 @@
 # RealSense ROSbag to VRS Converter
 
-**RealSense D435i ROSbagファイルをVRS (Virtual Reality Stream) 形式に変換し、カメラパラメータを含む完全な情報を保存・再生できるツールセット**
+**RealSense D435i ROSbagファイルをVRS (Virtual Reality Stream) 形式に変換し、カメラパラメータを含む情報を保存・再生できるツールセット**
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -23,7 +23,7 @@
 
 - **ROSbag → VRS 変換**: ROS1/ROS2両対応、Color + Depth 画像
 - **カメラパラメータ保存**: K行列、歪み係数、distortion model
-- **高効率圧縮**: LZ4/ZSTD対応、圧縮率 30-40%
+- **圧縮指定**: 公式 PyVRS writer adapter 経由で `lz4` / `zstd` / `none` を指定
 - **VRS ファイル検証**: ストリーム情報、Configuration、レコード数
 - **ROSbag同等の情報再生**: すべてのカメラパラメータを復元可能
 
@@ -47,31 +47,17 @@
 
 ```bash
 # 1. リポジトリクローン
-git clone --recursive https://github.com/yuki-inaho/realsense_rosbag_vrs_sandbox.git
+git clone https://github.com/yuki-inaho/realsense_rosbag_vrs_sandbox.git
 cd realsense_rosbag_vrs_sandbox
 
-# 2. システム依存関係インストール
-sudo apt-get install -y build-essential cmake ninja-build \
-    libboost-all-dev liblz4-dev libzstd-dev libjpeg-dev \
-    libeigen3-dev libgtest-dev pybind11-dev
+# 2. Python環境セットアップ
+uv sync --group dev
 
-# 3. Python環境セットアップ
-uv sync
-cd third/vrs && git submodule update --init --recursive
-mkdir -p build && cd build
-cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=../../vrs_install
-ninja && ninja install
-cd ../../..
+# 3. 変換実行
+uv run python convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
 
-# 4. pyvrs_writer ビルド
-cd pyvrs_writer && uv pip install -e . && cd ..
-
-# 5. 変換実行
-./convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
-
-# 6. 検証実行
-./inspect_vrs.py output.vrs --verbose
+# 4. 検証実行
+uv run python inspect_vrs.py output.vrs --verbose
 ```
 
 ---
@@ -84,53 +70,39 @@ cd pyvrs_writer && uv pip install -e . && cd ..
 - **uv** (Pythonパッケージマネージャ)
 - **Linux環境推奨** (PyVRS はLinux/macOSのみサポート)
 
-### システム依存関係
-
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential cmake ninja-build \
-    libboost-all-dev liblz4-dev libzstd-dev \
-    libjpeg-dev libeigen3-dev libgtest-dev \
-    pybind11-dev
-
-# macOS (Homebrew)
-brew install cmake ninja boost lz4 zstd jpeg eigen pybind11
-```
-
 ### Python環境とVRSライブラリ
 
 ```bash
 # 1. uvインストール (未インストールの場合)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Python依存関係
-uv sync
-
-# 3. VRS C++ライブラリのビルド
-cd third/vrs
-git submodule update --init --recursive
-mkdir -p build && cd build
-cmake .. -GNinja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=../../vrs_install
-ninja
-ninja install
-cd ../../..
-
-# 4. pyvrs_writer のビルド・インストール
-cd pyvrs_writer
-uv pip install -e .
-cd ..
+# 2. Python依存関係と開発ツール
+uv sync --group dev
 ```
+
+このリポジトリは自作 C++ writer や VRS submodule を保持しません。書き込みは PyPI `vrs>=1.2.2` に含まれる公式 PyVRS writer を `scripts/vrs_writer.py` の adapter 経由で使います。
+
+主要依存の下限は `pyproject.toml` で管理しています: `vrs>=1.2.2`, `pyrealsense2>=2.58.2.10647`, `rosbags>=0.11.3`, `opencv-python>=5.0.0.93`, `numpy>=1.24.0,<2.3`。Python 3.10.6 継続のため NumPy は `<2.3` に固定しています。
 
 ### インストール確認
 
 ```bash
 # ヘルプ表示（正常に動作すればOK）
-./convert_to_vrs.py --help
-./inspect_vrs.py --help
+uv run python convert_to_vrs.py --help
+uv run python inspect_vrs.py --help
+```
+
+### テスト
+
+```bash
+# 実 rosbag 不要の通常回帰
+uv run pytest -q -m "not integration"
+
+# writer/converter/CLI focused regression
+uv run pytest -q tests/test_official_pyvrs_writer.py tests/test_vrs_writer_adapter.py tests/test_converter_synthetic.py tests/test_cli_smoke.py
+
+# 実 rosbag 検証は明示的に環境変数を指定
+REALSENSE_ROSBAG_PATH=/absolute/path/to/sample.bag uv run pytest -q -m integration
 ```
 
 ---
@@ -141,31 +113,31 @@ cd ..
 
 ```bash
 # Step 1: ROSbag を VRS に変換
-./convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
+uv run python convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
 
 # Step 2: VRS ファイルを検証
-./inspect_vrs.py output.vrs --verbose
+uv run python inspect_vrs.py output.vrs --verbose
 
 # Step 3: 特定のストリームのみ表示
-./inspect_vrs.py output.vrs --stream 1001
+uv run python inspect_vrs.py output.vrs --stream 1001
 
 # Step 4: JSON形式で出力
-./inspect_vrs.py output.vrs --json > config.json
+uv run python inspect_vrs.py output.vrs --json > config.json
 ```
 
 ### convert_to_vrs.py - ROSbag → VRS 変換
 
 ```bash
 # 基本的な変換
-./convert_to_vrs.py INPUT.bag OUTPUT.vrs
+uv run python convert_to_vrs.py INPUT.bag OUTPUT.vrs
 
 # オプション
-./convert_to_vrs.py INPUT.bag OUTPUT.vrs \
+uv run python convert_to_vrs.py INPUT.bag OUTPUT.vrs \
     --compression zstd \  # 圧縮アルゴリズム (lz4/zstd/none)
     --verbose             # 詳細な進捗表示
 
 # 使用例
-./convert_to_vrs.py data/rosbag/d435i_walking.bag data/vrs/output.vrs --verbose
+uv run python convert_to_vrs.py data/rosbag/d435i_walking.bag data/vrs/output.vrs --verbose
 ```
 
 **出力例:**
@@ -191,7 +163,7 @@ Conversion Complete!
 ======================================================================
   Input size:       689.33 MB
   Output size:      253.03 MB
-  Compression:      36.71%
+  Compression:      output/input size ratio
   Total messages:   521
   - Color stream:   260 records
   - Depth stream:   261 records
@@ -297,25 +269,22 @@ realsense_rosbag_vrs_sandbox/
 ├── README.md                   # このファイル
 ├── scripts/
 │   ├── rosbag_to_vrs_converter.py  # 変換コアロジック
-│   ├── vrs_writer.py               # VRS Writer ラッパー
+│   ├── vrs_writer.py               # 公式 PyVRS writer adapter
 │   └── vrs_reader.py               # VRS Reader ラッパー
 ├── tests/
 │   ├── test_rosbag_to_vrs_converter.py
 │   ├── test_vrs_writer.py
 │   └── test_vrs_reader.py
-├── pyvrs_writer/               # C++ VRS Writer Python bindings
-│   ├── src/                    # C++ implementation
-│   ├── include/                # Header files
-│   ├── python/                 # Python package
-│   └── setup.py
 ├── docs/
 │   ├── IMPLEMENTATION.md       # 実装詳細（mermaid図含む）
 │   ├── VRS_API_CHEATSHEET.md   # VRS API チートシート
 │   ├── rosbag_to_vrs_converter_design.md
 │   ├── rosbag_to_vrs_mapping_spec.md
-│   └── work_plan_rosbag_to_vrs_nov19_2025.md  # 作業計画書（トラブルシューティング・開発者情報含む）
-└── third/
-    └── vrs/                    # VRS C++ library (submodule)
+│   └── work_plan_rosbag_to_vrs_nov19_2025.md  # 2025年時点の履歴記録
+└── tests/
+    ├── test_official_pyvrs_writer.py
+    ├── test_vrs_writer_adapter.py
+    └── test_real_rosbag_integration.py
 ```
 
 ---
@@ -353,5 +322,5 @@ realsense_rosbag_vrs_sandbox/
 ---
 
 **作成日:** 2025-11-19
-**更新日:** 2025-11-19
-**バージョン:** 1.0.0
+**更新日:** 2026-07-08
+**バージョン:** 1.1.0

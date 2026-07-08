@@ -10,14 +10,12 @@ Usage:
     ./convert_to_vrs.py input.bag output.vrs --verbose
     ./convert_to_vrs.py input.bag output.vrs --compression zstd
 """
-import sys
+
 import argparse
+import sys
 from pathlib import Path
 
-# Add scripts directory to path
-sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-
-from rosbag_to_vrs_converter import (  # noqa: E402
+from scripts.rosbag_to_vrs_converter import (
     RosbagToVRSConverter,
     create_rgbd_config,
     create_rgbd_imu_config,
@@ -100,7 +98,7 @@ Features:
     # Validate input
     if not args.input_bag.exists():
         print(f"Error: Input ROSbag not found: {args.input_bag}", file=sys.stderr)
-        print(f"\nTip: Check the file path and ensure the bag file exists.", file=sys.stderr)
+        print("\nTip: Check the file path and ensure the bag file exists.", file=sys.stderr)
         return 1
 
     # Create output directory if needed
@@ -131,21 +129,21 @@ Features:
         )
 
         if args.verbose:
-            print("="*70)
-            print(f"🔄 Converting ROSbag to VRS")
-            print("="*70)
+            print("=" * 70)
+            print("🔄 Converting ROSbag to VRS")
+            print("=" * 70)
             print(f"  Input:       {args.input_bag}")
             print(f"  Output:      {args.output_vrs}")
             print(f"  Compression: {args.compression}")
-            print(f"  Phase:       4A (Color + Depth)")
+            print("  Phase:       4A (Color + Depth)")
             print("-" * 70)
 
         result = converter.convert()
 
         # Print summary
-        print(f"\n{'='*70}")
-        print(f"✅ Conversion Complete!")
-        print(f"{'='*70}")
+        print(f"\n{'=' * 70}")
+        print("✅ Conversion Complete!")
+        print(f"{'=' * 70}")
         print(f"  Input size:       {result.input_bag_size / 1024 / 1024:.2f} MB")
         print(f"  Output size:      {result.output_vrs_size / 1024 / 1024:.2f} MB")
         print(f"  Compression:      {result.compression_ratio:.2%}")
@@ -155,25 +153,26 @@ Features:
         print(f"  Conversion time:  {result.conversion_time_sec:.2f}s")
         print(f"  Bag duration:     {result.duration_sec:.2f}s")
         print(f"\n📄 Output file: {args.output_vrs}")
-        print(f"\nTo inspect the VRS file, run:")
+        print("\nTo inspect the VRS file, run:")
         print(f"  ./inspect_vrs.py {args.output_vrs}")
 
         return 0
 
     except KeyboardInterrupt:
-        print(f"\n\n⚠️  Conversion cancelled by user.", file=sys.stderr)
+        print("\n\n⚠️  Conversion cancelled by user.", file=sys.stderr)
         return 130
     except Exception as e:
-        print(f"\n{'='*70}", file=sys.stderr)
-        print(f"❌ Conversion Failed", file=sys.stderr)
-        print(f"{'='*70}", file=sys.stderr)
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print("❌ Conversion Failed", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         if args.verbose:
-            print(f"\nDetailed traceback:", file=sys.stderr)
+            print("\nDetailed traceback:", file=sys.stderr)
             import traceback
+
             traceback.print_exc()
         else:
-            print(f"\nTip: Run with --verbose for detailed error information.", file=sys.stderr)
+            print("\nTip: Run with --verbose for detailed error information.", file=sys.stderr)
         return 1
 
 

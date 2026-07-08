@@ -10,18 +10,16 @@ Usage:
     ./inspect_vrs.py file.vrs --verbose
     ./inspect_vrs.py file.vrs --stream 1001
 """
-import sys
+
 import argparse
-from pathlib import Path
 import json
+import sys
+from pathlib import Path
 
-# Add scripts directory to path
-sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-
-from vrs_reader import VRSReader  # noqa: E402
+from scripts.vrs_reader import VRSReader
 
 
-def format_camera_matrix(matrix: list, name: str = "K") -> str:
+def format_camera_matrix(matrix: list[float], name: str = "K") -> str:
     """Format 3x3 camera matrix for display"""
     if len(matrix) != 9:
         return str(matrix)
@@ -29,7 +27,7 @@ def format_camera_matrix(matrix: list, name: str = "K") -> str:
     lines = []
     lines.append(f"    {name} matrix (3x3):")
     for i in range(3):
-        row = matrix[i*3:(i+1)*3]
+        row = matrix[i * 3 : (i + 1) * 3]
         lines.append(f"      [{row[0]:>10.4f}, {row[1]:>10.4f}, {row[2]:>10.4f}]")
     return "\n".join(lines)
 
@@ -103,7 +101,7 @@ Tip: This tool provides ROSbag-equivalent information display.
     # Validate input
     if not args.vrs_file.exists():
         print(f"Error: VRS file not found: {args.vrs_file}", file=sys.stderr)
-        print(f"\nTip: Check the file path and ensure the VRS file exists.", file=sys.stderr)
+        print("\nTip: Check the file path and ensure the VRS file exists.", file=sys.stderr)
         return 1
 
     # Inspect VRS file
@@ -125,7 +123,7 @@ Tip: This tool provides ROSbag-equivalent information display.
                 output = {
                     "file": str(args.vrs_file),
                     "size_mb": args.vrs_file.stat().st_size / 1024 / 1024,
-                    "streams": {}
+                    "streams": {},
                 }
 
                 for stream_id in stream_ids:
@@ -133,16 +131,16 @@ Tip: This tool provides ROSbag-equivalent information display.
                     record_count = reader.get_record_count(stream_id)
                     output["streams"][stream_id] = {
                         "record_count": record_count,
-                        "configuration": config
+                        "configuration": config,
                     }
 
                 print(json.dumps(output, indent=2))
                 return 0
 
             # Human-readable output
-            print("="*70)
-            print(f"📄 VRS File Inspection")
-            print("="*70)
+            print("=" * 70)
+            print("📄 VRS File Inspection")
+            print("=" * 70)
             print(f"  File:         {args.vrs_file.name}")
             print(f"  Path:         {args.vrs_file}")
             print(f"  Size:         {args.vrs_file.stat().st_size / 1024 / 1024:.2f} MB")
@@ -150,9 +148,9 @@ Tip: This tool provides ROSbag-equivalent information display.
 
             # Iterate through streams
             for idx, stream_id in enumerate(stream_ids, 1):
-                print(f"\n{'='*70}")
+                print(f"\n{'=' * 70}")
                 print(f"Stream {idx}/{len(stream_ids)}: ID {stream_id}")
-                print("="*70)
+                print("=" * 70)
 
                 # Get record count
                 record_count = reader.get_record_count(stream_id)
@@ -162,7 +160,7 @@ Tip: This tool provides ROSbag-equivalent information display.
                 try:
                     config = reader.read_configuration(stream_id)
                     if config:
-                        print(f"\n  ⚙️  Configuration:")
+                        print("\n  ⚙️  Configuration:")
 
                         # Resolution
                         if "width" in config and "height" in config:
@@ -174,33 +172,36 @@ Tip: This tool provides ROSbag-equivalent information display.
 
                         # Frame ID
                         if "frame_id" in config:
-                            frame_id = config['frame_id'] if config['frame_id'] else "(empty)"
+                            frame_id = config["frame_id"] if config["frame_id"] else "(empty)"
                             print(f"    Frame ID:     {frame_id}")
 
                         # Depth scale (for depth streams)
                         if "depth_scale" in config:
-                            print(f"    Depth Scale:  {config['depth_scale']} (depth units to meters)")
+                            print(
+                                f"    Depth Scale:  {config['depth_scale']} (depth units to meters)"
+                            )
 
                         # Camera intrinsic parameters
                         if "camera_k" in config:
                             if args.verbose:
-                                print(f"\n  📷 Camera Intrinsic Parameters:")
-                                print(format_camera_matrix(config['camera_k'], "K"))
+                                print("\n  📷 Camera Intrinsic Parameters:")
+                                print(format_camera_matrix(config["camera_k"], "K"))
                             else:
-                                k = config['camera_k']
+                                k = config["camera_k"]
                                 fx, fy = k[0], k[4]
                                 cx, cy = k[2], k[5]
-                                print(f"\n  📷 Camera Intrinsics:")
+                                print("\n  📷 Camera Intrinsics:")
                                 print(f"    fx: {fx:.2f}, fy: {fy:.2f}")
                                 print(f"    cx: {cx:.2f}, cy: {cy:.2f}")
 
                         # Distortion parameters
                         if "camera_d" in config:
-                            d = config['camera_d']
+                            d = config["camera_d"]
                             if args.verbose:
                                 print(f"\n    D (distortion): {d}")
                             else:
-                                print(f"    Distortion:   [{d[0]:.6f}, {d[1]:.6f}, {d[2]:.6f}, {d[3]:.6f}, {d[4]:.6f}]")
+                                distortion = ", ".join(f"{value:.6f}" for value in d[:5])
+                                print(f"    Distortion:   [{distortion}]")
 
                         # Distortion model
                         if "distortion_model" in config:
@@ -208,11 +209,23 @@ Tip: This tool provides ROSbag-equivalent information display.
 
                         # Verbose mode: show all other fields
                         if args.verbose:
-                            other_fields = {k: v for k, v in config.items()
-                                          if k not in ["width", "height", "encoding", "frame_id",
-                                                      "depth_scale", "camera_k", "camera_d", "distortion_model"]}
+                            other_fields = {
+                                k: v
+                                for k, v in config.items()
+                                if k
+                                not in [
+                                    "width",
+                                    "height",
+                                    "encoding",
+                                    "frame_id",
+                                    "depth_scale",
+                                    "camera_k",
+                                    "camera_d",
+                                    "distortion_model",
+                                ]
+                            }
                             if other_fields:
-                                print(f"\n  🔧 Other Configuration:")
+                                print("\n  🔧 Other Configuration:")
                                 for key, value in other_fields.items():
                                     print(f"    {key}: {value}")
                 except Exception as e:
@@ -229,42 +242,48 @@ Tip: This tool provides ROSbag-equivalent information display.
                                 first_record = records_list[0]
                                 last_record = records_list[-1]
 
-                                print(f"\n  ⏱️  Timestamp Range:")
+                                print("\n  ⏱️  Timestamp Range:")
                                 print(f"    First: {first_record.get('timestamp', 'N/A')}")
                                 print(f"    Last:  {last_record.get('timestamp', 'N/A')}")
 
                                 if args.verbose and "data" in first_record:
-                                    data_size = len(first_record["data"]) if isinstance(first_record["data"], (bytes, list)) else 0
-                                    print(f"\n  💾 Data Size:")
+                                    data_size = (
+                                        len(first_record["data"])
+                                        if isinstance(first_record["data"], (bytes, list))
+                                        else 0
+                                    )
+                                    print("\n  💾 Data Size:")
                                     print(f"    First record: {data_size:,} bytes")
                                     if data_size > 0:
-                                        print(f"    Estimated total: {data_size * record_count / 1024 / 1024:.2f} MB")
+                                        estimated_mb = data_size * record_count / 1024 / 1024
+                                        print(f"    Estimated total: {estimated_mb:.2f} MB")
 
                     except Exception as e:
                         # Generator error is expected with current implementation
                         if "generator" not in str(e).lower():
                             print(f"  ⚠️  Data Records: Error reading - {e}")
 
-            print(f"\n{'='*70}")
+            print(f"\n{'=' * 70}")
             print("✅ Inspection complete.")
-            print(f"\nTip: Use --verbose for detailed camera matrices and parameters.")
+            print("\nTip: Use --verbose for detailed camera matrices and parameters.")
 
         return 0
 
     except KeyboardInterrupt:
-        print(f"\n\n⚠️  Inspection cancelled by user.", file=sys.stderr)
+        print("\n\n⚠️  Inspection cancelled by user.", file=sys.stderr)
         return 130
     except Exception as e:
-        print(f"\n{'='*70}", file=sys.stderr)
-        print(f"❌ Inspection Failed", file=sys.stderr)
-        print(f"{'='*70}", file=sys.stderr)
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print("❌ Inspection Failed", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         if args.verbose:
-            print(f"\nDetailed traceback:", file=sys.stderr)
+            print("\nDetailed traceback:", file=sys.stderr)
             import traceback
+
             traceback.print_exc()
         else:
-            print(f"\nTip: Run with --verbose for detailed error information.", file=sys.stderr)
+            print("\nTip: Run with --verbose for detailed error information.", file=sys.stderr)
         return 1
 
 

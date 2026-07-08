@@ -1,7 +1,8 @@
 """Tests for ROSbag reading functionality."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 class TestRosbagReader:

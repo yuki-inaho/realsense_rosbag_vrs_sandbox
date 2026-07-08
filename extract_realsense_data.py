@@ -15,8 +15,7 @@ import sys
 from pathlib import Path
 
 from scripts.rosbag_reader import RosbagReader
-from scripts.timestamp_handler import ros_timestamp_to_datetime, format_timestamp_iso
-from scripts.data_extractor import DataExtractor
+from scripts.timestamp_handler import format_timestamp_iso, ros_timestamp_to_datetime
 
 
 def main() -> int:
@@ -24,11 +23,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract RealSense data from ROS bag files with timestamps"
     )
-    parser.add_argument(
-        "bagfile",
-        type=Path,
-        help="Path to the ROS bag file"
-    )
+    parser.add_argument("bagfile", type=Path, help="Path to the ROS bag file")
     parser.add_argument(
         "--output",
         "-o",
@@ -62,6 +57,7 @@ def main() -> int:
         print(f"Error: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 
@@ -96,7 +92,7 @@ def extract_realsense_data(bagfile: Path, output_dir: Path, verbose: bool = Fals
             print(f"    Type: {info['msgtype']}")
             print(f"    Messages: {info['msgcount']}")
 
-            if verbose and info['msgcount'] > 0:
+            if verbose and info["msgcount"] > 0:
                 # Show first and last message timestamps
                 messages = list(reader.read_messages(topic))
                 if messages:
@@ -117,7 +113,7 @@ def extract_realsense_data(bagfile: Path, output_dir: Path, verbose: bool = Fals
             print(f"    Type: {info['msgtype']}")
             print(f"    Messages: {info['msgcount']}")
 
-            if verbose and info['msgcount'] > 0:
+            if verbose and info["msgcount"] > 0:
                 # Show first and last message timestamps
                 messages = list(reader.read_messages(topic))
                 if messages:
@@ -132,12 +128,8 @@ def extract_realsense_data(bagfile: Path, output_dir: Path, verbose: bool = Fals
         print()
 
         # Summary
-        total_image_messages = sum(
-            topics_info[topic]["msgcount"] for topic in image_topics
-        )
-        total_imu_messages = sum(
-            topics_info[topic]["msgcount"] for topic in imu_topics
-        )
+        total_image_messages = sum(topics_info[topic]["msgcount"] for topic in image_topics)
+        total_imu_messages = sum(topics_info[topic]["msgcount"] for topic in imu_topics)
 
         print("Summary:")
         print(f"  Image topics: {len(image_topics)} ({total_image_messages} messages)")

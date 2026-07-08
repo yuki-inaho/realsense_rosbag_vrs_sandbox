@@ -17,9 +17,9 @@ def investigate_module(module: Any, module_name: str) -> None:
         module: The module to investigate
         module_name: Name of the module
     """
-    print(f"# PyVRS API Investigation\n")
+    print("# PyVRS API Investigation\n")
     print(f"**Module:** `{module_name}`\n")
-    print(f"**Date:** 2025-11-19\n")
+    print("**Date:** 2025-11-19\n")
     print("---\n")
 
     # Top-level attributes
@@ -59,7 +59,11 @@ def investigate_module(module: Any, module_name: str) -> None:
             print(f"**Description:** {doc_lines[0]}\n")
 
         # Methods
-        methods = [m for m in dir(cls) if not m.startswith("_") or m in ["__init__", "__enter__", "__exit__"]]
+        methods = [
+            m
+            for m in dir(cls)
+            if not m.startswith("_") or m in ["__init__", "__enter__", "__exit__"]
+        ]
         if methods:
             print(f"**Methods:** {len(methods)}\n")
             for method_name in sorted(methods):
@@ -152,6 +156,7 @@ def main() -> int:
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         return 1
 

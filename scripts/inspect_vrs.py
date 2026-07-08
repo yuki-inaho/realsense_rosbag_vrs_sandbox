@@ -8,10 +8,10 @@ Usage:
     python scripts/inspect_vrs.py file.vrs
     python scripts/inspect_vrs.py file.vrs --verbose
 """
-import sys
+
 import argparse
+import sys
 from pathlib import Path
-import json
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -78,13 +78,14 @@ Examples:
                 try:
                     config = reader.read_configuration(stream_id)
                     if config:
-                        print(f"  Configuration:")
+                        print("  Configuration:")
                         if args.verbose:
                             # Pretty print full configuration
                             for key, value in config.items():
                                 if isinstance(value, (list, tuple)) and len(value) > 5:
                                     # Truncate long arrays
-                                    print(f"    {key}: [{value[0]}, {value[1]}, ..., {value[-1]}] ({len(value)} elements)")
+                                    summary = f"[{value[0]}, {value[1]}, ..., {value[-1]}]"
+                                    print(f"    {key}: {summary} ({len(value)} elements)")
                                 else:
                                     print(f"    {key}: {value}")
                         else:
@@ -105,15 +106,22 @@ Examples:
                     try:
                         data_records = reader.read_data_records(stream_id)
                         if data_records:
-                            first_record = data_records[0]
-                            last_record = data_records[-1]
+                            records_list = list(data_records)
+                            if not records_list:
+                                continue
+                            first_record = records_list[0]
+                            last_record = records_list[-1]
 
-                            print(f"  Data Records:")
+                            print("  Data Records:")
                             print(f"    First timestamp: {first_record.get('timestamp', 'N/A')}")
                             print(f"    Last timestamp: {last_record.get('timestamp', 'N/A')}")
 
                             if args.verbose and "data" in first_record:
-                                data_size = len(first_record["data"]) if isinstance(first_record["data"], (bytes, list)) else 0
+                                data_size = (
+                                    len(first_record["data"])
+                                    if isinstance(first_record["data"], (bytes, list))
+                                    else 0
+                                )
                                 print(f"    Data size (first record): {data_size} bytes")
 
                     except Exception as e:
@@ -128,6 +136,7 @@ Examples:
         print(f"Error: Failed to inspect VRS file: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 

@@ -4,8 +4,9 @@ This module contains unit tests for the VRS Reader wrapper class,
 which provides a Pythonic interface to the PyVRS library.
 """
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 @pytest.fixture

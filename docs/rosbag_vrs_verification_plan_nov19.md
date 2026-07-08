@@ -1,5 +1,7 @@
 # 作業計画書 兼 記録書：ROSbag互換VRS読み取り検証
 
+> 注記: この文書は 2025-11-19 時点の履歴記録です。本文中の `pyvrs_writer/` や `third/vrs` を使う手順は現行手順ではありません。現行実装では自作 C++ writer / VRS submodule は削除済みで、`scripts/vrs_writer.py` の公式 PyVRS writer adapter を使います。
+
 **日付：** 2025年11月19日
 **作業ディレクトリ・リポジトリ:** /home/user/realsense_rosbag_vrs_sandbox (yuki-inaho/realsense_rosbag_vrs_sandbox)
 **作業者：** Claude (Sonnet 4.5)
