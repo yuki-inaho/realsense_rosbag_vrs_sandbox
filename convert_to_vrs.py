@@ -15,6 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from scripts import __version__
 from scripts.rosbag_to_vrs_converter import (
     RosbagToVRSConverter,
     create_rgbd_config,
@@ -90,7 +91,7 @@ Features:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 1.0.0 (RGB-D + IMU + Transform support)",
+        version=f"%(prog)s {__version__} (official VRS writer, schema 2)",
     )
 
     args = parser.parse_args()

@@ -1,326 +1,118 @@
 # RealSense ROSbag to VRS Converter
 
-**RealSense D435i ROSbagファイルをVRS (Virtual Reality Stream) 形式に変換し、カメラパラメータを含む情報を保存・再生できるツールセット**
+**RealSense 型の ROSbag を、公式 VRS 実装を用いて RGB・深度・IMU・設定情報を含む VRS に変換します。**
 
-[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-
-## 目次
-
-- [概要](#概要)
-- [クイックスタート](#クイックスタート)
-- [インストール](#インストール)
-- [使用方法](#使用方法)
-- [データ構造](#データ構造)
-- [ドキュメント](#ドキュメント)
-
----
+[![Python Version](https://img.shields.io/badge/python-3.10.6%2B-blue)](https://www.python.org/)
 
 ## 概要
 
-このプロジェクトは、RealSense D435iで撮影したRGB-Dデータ（ROSbag形式）を、Meta社が開発したVRS (Virtual Reality Stream) 形式に変換するツールです。VRS形式への変換により、AR/VRエコシステム（Meta Quest、Project Aria等）との互換性を確保し、効率的なストレージと再生を実現します。
+書き込みには、PyPI パッケージ [`vrs`](https://pypi.org/project/vrs/) に含まれる公式 `vrsbindings.Writer` を使用します。自作 C++ ライターや VRS サブモジュールは不要です。PyVRS の公開名を書き換える補正処理も使用しません。
 
-### 主な機能
+保存形式バージョン 2 では、RGB・深度を本来の寸法と画素型の画像ブロック、IMU を数値メタデータとして記録します。論理ストリーム番号やセンサー設定は、このリポジトリの規約に従うタグに保持します。**VRS ファイルとして読めることと、Project Aria などの機器固有のデータ定義に適合することは別です。機器固有の互換性は保証していません。**
 
-- **ROSbag → VRS 変換**: ROS1/ROS2両対応、Color + Depth 画像
-- **カメラパラメータ保存**: K行列、歪み係数、distortion model
-- **圧縮指定**: 公式 PyVRS writer adapter 経由で `lz4` / `zstd` / `none` を指定
-- **VRS ファイル検証**: ストリーム情報、Configuration、レコード数
-- **ROSbag同等の情報再生**: すべてのカメラパラメータを復元可能
+| 保存対象 | 論理ストリーム番号 | 内容 |
+|---|---|---|
+| Color | 1001 | 画像、寸法・画素形式、K・D・R・P、歪みモデル、frame_id、取得可能な StreamInfo |
+| Depth | 1002 | 深度画像、カメラ情報、記録された Depth Units に基づく換算係数 |
+| 加速度・角速度 | 1003・1004 | 各3成分、単位、frame_id、記録された取得頻度 |
+| Transform | 1005・1006 | Depth・Color の並進とクォータニオン |
+| Device Info | 2001 | デバイス名、製造番号、ファームウェア情報など |
+| Sensor Info | 2002～2004 | センサー名、対応する論理ストリーム |
+| Options | 2005 | センサー別の設定値と説明。設定のみで Data レコードは作成しません |
 
-### 対応データ
+赤外線画像とフレームごとの追加メタデータは未対応です。ROSbag の全フィールドを保存する実装ではありません。入力は `rosbags.highlevel.AnyReader` を利用しますが、現在の本物のファイルを使う一連の回帰テストは **ROS1 の RealSense 型トピック**を対象としています。任意の ROS2 記録の互換性を保証するものではありません。
 
-| データ種別 | ステータス | ストリームID | 説明 |
-|-----------|----------|------------|------|
-| Color Image | 実装済み | 1001 | RGB画像 + カメラ内部パラメータ + StreamInfo (fps, encoding) |
-| Depth Image | 実装済み | 1002 | Depth画像 + depth_scale + カメラパラメータ + StreamInfo (fps, encoding) |
-| Transform | 実装済み | 1005, 1006 | カメラ外部パラメータ (Depth, Color) |
-| IMU (Accel) | 実装済み | 1003 | 加速度センサー + StreamInfo (fps, encoding) |
-| IMU (Gyro) | 実装済み | 1004 | ジャイロセンサー + StreamInfo (fps, encoding) |
-| Device Info | 実装済み | 2001 | デバイス情報 (名称, SN, FW version等) |
-| Sensor Info | 実装済み | 2002-2004 | センサー情報 (Stereo/RGB/Motion Module) |
-| Options | 実装済み | 2005 | センサー設定オプション (25オプション: Exposure, Gain, Laser Power等) |
-| Metadata | 未実装 | - | 画像・IMUメタデータ (14,219メッセージ) |
+## 人工データによるクイックスタート
 
----
-
-## クイックスタート
+カメラや実収録データは必要ありません。人工 bag を一時ディレクトリに生成し、実際の VRS へ変換できます。
 
 ```bash
-# 1. リポジトリクローン
 git clone https://github.com/yuki-inaho/realsense_rosbag_vrs_sandbox.git
 cd realsense_rosbag_vrs_sandbox
+uv sync --locked --group dev
 
-# 2. Python環境セットアップ
-uv sync --group dev
-
-# 3. 変換実行
-uv run python convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
-
-# 4. 検証実行
-uv run python inspect_vrs.py output.vrs --verbose
+VRS_DEMO_DIR=$(mktemp -d)
+uv run python -m scripts.synthetic_rosbag "$VRS_DEMO_DIR/synthetic.bag"
+uv run python convert_to_vrs.py "$VRS_DEMO_DIR/synthetic.bag" "$VRS_DEMO_DIR/synthetic.vrs" --imu --compression zstd
+uv run python inspect_vrs.py "$VRS_DEMO_DIR/synthetic.vrs" --verbose
 ```
 
----
+生成器の既定値は **640×480、RGB-D 各4フレーム、加速度・角速度各4件**です。校正、外部パラメータ、人工のデバイス情報・設定値も含みます。実収録ファイルを読み取ったり、ネットワークからデータを取得したりしません。生成器は既存ファイルへの上書きを拒否します。`*.bag` と `*.vrs` は Git の対象外です。
 
-## インストール
+生成オプションとテストの合格条件は [人工 ROSbag と一連の変換テスト](docs/SYNTHETIC_E2E.md) に記載しています。
 
-### 前提条件
+## 環境とバージョン
 
-- **Python 3.10以上**
-- **uv** (Pythonパッケージマネージャ)
-- **Linux環境推奨** (PyVRS はLinux/macOSのみサポート)
+- Python の指定は `.python-version` の **3.10.6**、許容条件は **3.10.6 以上**です。
+- `uv.lock` が固定する PyVRS は **1.2.2** です。2026年10月30日の確認時点で、[公式の最新公開版](https://github.com/facebookresearch/pyvrs/releases/tag/v1.2.2)と一致します。開発中の `main` の版番号とは区別しています。
+- [PyVRS 1.2.2 のソース](https://github.com/facebookresearch/pyvrs/tree/v1.2.2/csrc)が参照する C++ VRS は、ソースの `version.txt` 上で **1.4.0** です。これはインストール済みバイナリの厳密なビルド元を同定する情報ではありません。
+- Python 3.10 を継続できるよう、NumPy は `>=1.24.0,<2.3`、固定版は **2.2.6** です。
+- 通常の開発・テストには Linux x86-64 を使用します。利用可能なバイナリ配布物は [PyPI](https://pypi.org/project/vrs/1.2.2/#files) で確認できます。
 
-### Python環境とVRSライブラリ
+主要依存は [pyproject.toml](pyproject.toml)、固定された依存構成は [uv.lock](uv.lock) を参照してください。パッケージ自身の版は **0.1.0**、本リポジトリの **保存形式の版は 2** です。
+
+## 変換と確認
+
+`--imu` を指定すると、加速度・角速度と Device／Sensor／Options の保存も有効になります。通常の RGB-D 構成には Transform を含みます。
 
 ```bash
-# 1. uvインストール (未インストールの場合)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Python依存関係と開発ツール
-uv sync --group dev
+uv run python convert_to_vrs.py INPUT.bag OUTPUT.vrs --imu --compression lz4
+uv run python inspect_vrs.py OUTPUT.vrs --stream 1001 --verbose
+uv run python inspect_vrs.py OUTPUT.vrs --json
 ```
 
-このリポジトリは自作 C++ writer や VRS submodule を保持しません。書き込みは PyPI `vrs>=1.2.2` に含まれる公式 PyVRS writer を `scripts/vrs_writer.py` の adapter 経由で使います。
+圧縮は `none`・`lz4`・`zstd` に対応します。画像の行余白とバイト順は解釈してから保存し、解像度・画像形式・ペイロード長の不一致はエラーにします。
 
-主要依存の下限は `pyproject.toml` で管理しています: `vrs>=1.2.2`, `pyrealsense2>=2.58.2.10647`, `rosbags>=0.11.3`, `opencv-python>=5.0.0.93`, `numpy>=1.24.0,<2.3`。Python 3.10.6 継続のため NumPy は `<2.3` に固定しています。
+深度の換算係数は、そのセンサーに記録された `Depth Units` から取得します。記録がない場合は `0.001` を使用し、設定の `depth_scale_source` に `default_millimeters` と明示します。IMU の取得頻度は StreamInfo がある場合に保存し、不明な場合の `sample_rate` は `null` です。
 
-### インストール確認
-
-```bash
-# ヘルプ表示（正常に動作すればOK）
-uv run python convert_to_vrs.py --help
-uv run python inspect_vrs.py --help
-```
-
-### テスト
+## テスト
 
 ```bash
-# 実 rosbag 不要の通常回帰
+# 実収録データが不要な全回帰。一連の変換テストも含みます。
 uv run pytest -q -m "not integration"
 
-# writer/converter/CLI focused regression
-uv run pytest -q tests/test_official_pyvrs_writer.py tests/test_vrs_writer_adapter.py tests/test_converter_synthetic.py tests/test_cli_smoke.py
+# 人工 ROSbag → 変換 CLI → 公式 PyVRS リーダーの検証
+uv run pytest -q -m e2e
 
-# 実 rosbag 検証は明示的に環境変数を指定
+# 利用者が手元で明示指定する実収録 bag の検証
 REALSENSE_ROSBAG_PATH=/absolute/path/to/sample.bag uv run pytest -q -m integration
 ```
 
----
+一連の変換テストでは **640×480×12フレーム**を生成し、3種類の圧縮で全画素・全 IMU 成分・時刻・校正・外部パラメータ・設定を比較します。12フレーム分は既定の 16 MiB 書き出し閾値を超えるため、途中の書き出し後にもレコードが欠落しないことを確認します。期待値は入力 bag から独立に読み出し、出力はリポジトリのリーダーを介さず公式 PyVRS で検査します。
 
-## 使用方法
+[GitHub Actions の設定](.github/workflows/tests.yml)は Python 3.10.6 と 3.12 で固定依存、静的検査、実収録不要のテストを実行します。個々の実行の合否は Actions の実行結果で確認してください。
 
-### 基本的なワークフロー
+## 実装の構成
 
-```bash
-# Step 1: ROSbag を VRS に変換
-uv run python convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
+| ファイル | 役割 |
+|---|---|
+| [scripts/synthetic_rosbag.py](scripts/synthetic_rosbag.py) | 人工 ROS1 bag の生成 |
+| [scripts/rosbag_to_vrs_converter.py](scripts/rosbag_to_vrs_converter.py) | 設定取得、画像・IMU の変換、統計 |
+| [scripts/image_payload.py](scripts/image_payload.py) | ROS 画像の寸法・行余白・バイト順の検証と正規化 |
+| [scripts/vrs_writer.py](scripts/vrs_writer.py) | 公式ライターを用いた画像・数値・バイト列の保存 |
+| [scripts/vrs_schema.py](scripts/vrs_schema.py) | 保存形式バージョンとタグの定義 |
+| [scripts/vrs_reader.py](scripts/vrs_reader.py) | 現行形式と過去の形式の読み出し |
+| [tests/test_synthetic_e2e.py](tests/test_synthetic_e2e.py) | 実際の bag／VRS を使う独立検証 |
 
-# Step 2: VRS ファイルを検証
-uv run python inspect_vrs.py output.vrs --verbose
-
-# Step 3: 特定のストリームのみ表示
-uv run python inspect_vrs.py output.vrs --stream 1001
-
-# Step 4: JSON形式で出力
-uv run python inspect_vrs.py output.vrs --json > config.json
-```
-
-### convert_to_vrs.py - ROSbag → VRS 変換
-
-```bash
-# 基本的な変換
-uv run python convert_to_vrs.py INPUT.bag OUTPUT.vrs
-
-# オプション
-uv run python convert_to_vrs.py INPUT.bag OUTPUT.vrs \
-    --compression zstd \  # 圧縮アルゴリズム (lz4/zstd/none)
-    --verbose             # 詳細な進捗表示
-
-# 使用例
-uv run python convert_to_vrs.py data/rosbag/d435i_walking.bag data/vrs/output.vrs --verbose
-```
-
-**出力例:**
-
-```
-======================================================================
-Converting ROSbag to VRS
-======================================================================
-  Input:       data/rosbag/d435i_walking.bag
-  Output:      data/vrs/output.vrs
-  Compression: lz4
-  Phase:       4A (Color + Depth)
-----------------------------------------------------------------------
-Created stream 1001: RealSense_D435i_Color|id:1001
-Created stream 1002: RealSense_D435i_Depth|id:1002
-Cached CameraInfo from /device_0/sensor_0/Depth_0/info/camera_info
-Cached CameraInfo from /device_0/sensor_1/Color_0/info/camera_info
-Wrote Configuration for stream 1001 (Color): 640x480
-Wrote Configuration for stream 1002 (Depth): 1280x720
-
-======================================================================
-Conversion Complete!
-======================================================================
-  Input size:       689.33 MB
-  Output size:      253.03 MB
-  Compression:      output/input size ratio
-  Total messages:   521
-  - Color stream:   260 records
-  - Depth stream:   261 records
-  Conversion time:  18.81s
-```
-
-### inspect_vrs.py - VRS ファイル検証
-
-```bash
-# 基本情報表示
-./inspect_vrs.py OUTPUT.vrs
-
-# 詳細情報表示（カメラ行列含む）
-./inspect_vrs.py OUTPUT.vrs --verbose
-
-# 特定のストリームのみ
-./inspect_vrs.py OUTPUT.vrs --stream 1001
-
-# JSON形式で出力
-./inspect_vrs.py OUTPUT.vrs --json > config.json
-```
-
-**出力例:**
-
-```
-======================================================================
-VRS File Inspection
-======================================================================
-  File:         output.vrs
-  Size:         253.03 MB
-  Total Streams: 2
-
-======================================================================
-Stream 1/2: ID 1001
-======================================================================
-  Record Count: 260
-
-  Configuration:
-    Resolution:   640x480
-    Encoding:     rgb8
-
-  Camera Intrinsics:
-    fx: 616.52, fy: 616.65
-    cx: 315.87, cy: 244.28
-    Distortion:   [0.000000, 0.000000, 0.000000, 0.000000, 0.000000]
-    Model:        Brown Conrady
-
-  Timestamp Range:
-    First: 1543155318.345
-    Last:  1543155319.356
-```
-
----
-
-## データ構造
-
-### ROSbag → VRS マッピング
-
-| ROSbag トピック | VRS Stream | 説明 |
-|----------------|-----------|------|
-| `/device_0/sensor_1/Color_0/image/data` | 1001 (Data) | RGB画像データ |
-| `/device_0/sensor_1/Color_0/info/camera_info` | 1001 (Config) | カメラ内部パラメータ |
-| `/device_0/sensor_0/Depth_0/image/data` | 1002 (Data) | Depth画像データ |
-| `/device_0/sensor_0/Depth_0/info/camera_info` | 1002 (Config) | Depth カメラパラメータ |
-
-### Configuration レコード構造
-
-#### Color Stream (1001)
-
-```json
-{
-  "width": 640,
-  "height": 480,
-  "encoding": "rgb8",
-  "camera_k": [fx, 0, cx, 0, fy, cy, 0, 0, 1],
-  "camera_d": [k1, k2, p1, p2, k3],
-  "distortion_model": "Brown Conrady",
-  "frame_id": ""
-}
-```
-
-#### Depth Stream (1002)
-
-```json
-{
-  "width": 1280,
-  "height": 720,
-  "encoding": "16UC1",
-  "camera_k": [fx, 0, cx, 0, fy, cy, 0, 0, 1],
-  "camera_d": [k1, k2, p1, p2, k3],
-  "distortion_model": "Brown Conrady",
-  "depth_scale": 0.001,
-  "frame_id": ""
-}
-```
-
-### プロジェクト構造
-
-```
-realsense_rosbag_vrs_sandbox/
-├── convert_to_vrs.py          # 変換ツール（ユーザー向け）
-├── inspect_vrs.py              # 検証ツール（ユーザー向け）
-├── README.md                   # このファイル
-├── scripts/
-│   ├── rosbag_to_vrs_converter.py  # 変換コアロジック
-│   ├── vrs_writer.py               # 公式 PyVRS writer adapter
-│   └── vrs_reader.py               # VRS Reader ラッパー
-├── tests/
-│   ├── test_rosbag_to_vrs_converter.py
-│   ├── test_vrs_writer.py
-│   └── test_vrs_reader.py
-├── docs/
-│   ├── IMPLEMENTATION.md       # 実装詳細（mermaid図含む）
-│   ├── VRS_API_CHEATSHEET.md   # VRS API チートシート
-│   ├── rosbag_to_vrs_converter_design.md
-│   ├── rosbag_to_vrs_mapping_spec.md
-│   └── work_plan_rosbag_to_vrs_nov19_2025.md  # 2025年時点の履歴記録
-└── tests/
-    ├── test_official_pyvrs_writer.py
-    ├── test_vrs_writer_adapter.py
-    └── test_real_rosbag_integration.py
-```
-
----
+過去の1行 GREY8 保存形式と CUSTOM ブロックを読む互換処理は残しています。旧 GREY8 形式はテスト時に再生成して検証します。過去のすべての収録ファイルの互換性を確認したわけではありません。
 
 ## ドキュメント
 
-### 主要ドキュメント
+- [人工 ROSbag と一連の変換テスト](docs/SYNTHETIC_E2E.md)
+- [実装詳細](docs/IMPLEMENTATION.md)
+- [VRS API チートシート](docs/VRS_API_CHEATSHEET.md)
+- [2025年の作業記録](docs/work_plan_rosbag_to_vrs_nov19_2025.md)：過去の設計と経緯。現行仕様は上記3文書を参照してください。
 
-- **[実装詳細 (IMPLEMENTATION.md)](docs/IMPLEMENTATION.md)**: システムアーキテクチャと実装の詳細説明（mermaid図含む）
-- **[VRS API チートシート (VRS_API_CHEATSHEET.md)](docs/VRS_API_CHEATSHEET.md)**: VRS APIの逆引きリファレンス
+## ライセンスと参照先
 
-### 設計ドキュメント
+従来のライセンス説明は Apache 2.0 です。依存ライブラリについては各公式リポジトリのライセンスを参照してください。
 
-- [設計書 (rosbag_to_vrs_converter_design.md)](docs/rosbag_to_vrs_converter_design.md): 変換ロジックの詳細設計
-- [マッピング仕様 (rosbag_to_vrs_mapping_spec.md)](docs/rosbag_to_vrs_mapping_spec.md): ROSbag → VRS データマッピング詳細
+- [VRS](https://github.com/facebookresearch/vrs)
+- [PyVRS](https://github.com/facebookresearch/pyvrs)
+- [rosbags](https://gitlab.com/ternaris/rosbags)
 
----
+**更新日:** 2026-10-30
 
-## ライセンス
+**パッケージ版:** 0.1.0
 
-本プロジェクトは以下のライセンスに準じます：
-
-- **VRS C++ Library**: Apache 2.0 (Meta Reality Labs Research)
-- **PyVRS**: Apache 2.0
-- **本プロジェクトコード**: Apache 2.0
-
----
-
-## 謝辞
-
-- [VRS (Virtual Reality Stream)](https://github.com/facebookresearch/vrs) - Meta Reality Labs Research
-- [PyVRS](https://github.com/facebookresearch/pyvrs) - Python bindings for VRS
-- [rosbags](https://gitlab.com/ternaris/rosbags) - Pure Python ROSbag library
-
----
-
-**作成日:** 2025-11-19
-**更新日:** 2026-07-08
-**バージョン:** 1.1.0
+**保存形式版:** 2

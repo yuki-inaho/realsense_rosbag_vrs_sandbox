@@ -1,62 +1,102 @@
-"""Regression tests for the official PyVRS writer API."""
+"""Check the written format with the unmodified official PyVRS reader."""
 
 from __future__ import annotations
 
+import json
+import struct
 from pathlib import Path
-from typing import Any
+
+import numpy as np
+import pytest
+
+from scripts.vrs_schema import (
+    CONFIG_JSON_TAG,
+    IMU_VECTOR,
+    NATIVE_IMAGE,
+    PAYLOAD_ENCODING_TAG,
+    SCHEMA_VERSION,
+    SCHEMA_VERSION_TAG,
+    USER_STREAM_ID_TAG,
+)
+from scripts.vrs_writer import VRSWriter, load_official_writer_backend
 
 
-def _find_official_writer() -> tuple[str, type[Any]]:
-    """Return the first supported official PyVRS writer class."""
-    from scripts.vrs_writer import load_official_writer_backend
+def test_official_backend_does_not_patch_pyvrs() -> None:
+    """The official native writer needs no missing-export or enum monkeypatch."""
+    import pyvrs
+    import vrsbindings
 
-    import_path, writer_cls, _pyvrs = load_official_writer_backend()
-    return import_path, writer_cls
+    symbols = ("RecordFormat", "Stream", "Writer")
+    before = {name: getattr(pyvrs, name, None) for name in symbols}
+    compression_alias = getattr(pyvrs.CompressionPreset, "Zmedium", None)
+    import_path, writer_cls, bindings = load_official_writer_backend()
+
+    assert import_path == "vrsbindings.Writer"
+    assert writer_cls is vrsbindings.Writer
+    assert bindings is vrsbindings
+    assert before == {name: getattr(pyvrs, name, None) for name in symbols}
+    assert getattr(pyvrs.CompressionPreset, "Zmedium", None) is compression_alias
 
 
-def test_official_vrs_writer_imports() -> None:
-    """The official PyVRS writer must be importable from one known path."""
-    import_path, writer_cls = _find_official_writer()
+@pytest.mark.parametrize("compression", ["none", "lz4", "zstd"])
+def test_official_reader_sees_real_images_and_typed_imu(tmp_path: Path, compression: str) -> None:
+    """RGB/depth shapes, all pixels, and IMU values survive repeated native flushes."""
+    import pyvrs
 
-    assert import_path
-    assert callable(writer_cls)
+    color = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
+    depth = np.array([[0, 1, 255, 256], [257, 1000, 32768, 65535], [2, 3, 4, 5]], dtype="<u2")
+    accel = (0.125, -0.25, 9.80665)
+    gyro = (-1.0, 0.0, 1.5)
+    config = {
+        1001: {"width": 4, "height": 3, "encoding": "rgb8", "camera_k": [1.0] * 9},
+        1002: {"width": 4, "height": 3, "encoding": "16UC1", "depth_scale": 0.001},
+        1003: {"sensor_type": "accelerometer"},
+        1004: {"sensor_type": "gyroscope"},
+        2001: {"serial_number": "synthetic-only"},
+    }
+    path = tmp_path / "native_types.vrs"
+    with VRSWriter(path, compression=compression, flush_records=1) as writer:
+        for stream_id, configuration in config.items():
+            writer.add_stream(stream_id, f"synthetic-{stream_id}")
+            writer.write_configuration(stream_id, configuration)
+        for timestamp in (0.0, 0.033):
+            writer.write_data(1001, timestamp, color.tobytes())
+            writer.write_data(1002, timestamp, depth.tobytes())
+            writer.write_data(1003, timestamp, struct.pack("<ddd", *accel))
+            writer.write_data(1004, timestamp, struct.pack("<ddd", *gyro))
 
-
-def test_official_vrs_writer_roundtrip_color_depth_imu(tmp_path: Path) -> None:
-    """Official writer must support a minimal color/depth/IMU roundtrip."""
-    import_path, _writer_cls = _find_official_writer()
-
-    output_vrs = tmp_path / "official_writer_roundtrip.vrs"
-    from scripts.vrs_writer import VRSWriter
-
-    writer = VRSWriter(str(output_vrs), compression="none")
-    assert writer.backend_name == import_path
-
-    assert hasattr(writer, "add_stream"), f"{import_path} has no add_stream API"
-    assert hasattr(writer, "write_configuration"), f"{import_path} has no write_configuration API"
-    assert hasattr(writer, "write_data"), f"{import_path} has no write_data API"
-
-    writer.add_stream(1001, "RealSense_D435i_Color|id:1001")
-    writer.add_stream(1002, "RealSense_D435i_Depth|id:1002")
-    writer.add_stream(1003, "RealSense_D435i_Accel|id:1003")
-    writer.add_stream(1004, "RealSense_D435i_Gyro|id:1004")
-    writer.write_configuration(1001, {"width": 2, "height": 2, "encoding": "rgb8"})
-    writer.write_configuration(1002, {"width": 2, "height": 2, "encoding": "16UC1"})
-    writer.write_configuration(1003, {"sensor_type": "accelerometer"})
-    writer.write_configuration(1004, {"sensor_type": "gyroscope"})
-    writer.write_data(1001, 0.0, bytes(range(12)))
-    writer.write_data(1002, 0.0, bytes(range(8)))
-    writer.write_data(1003, 0.0, bytes(24))
-    writer.write_data(1004, 0.0, bytes(24))
-    if hasattr(writer, "close"):
-        writer.close()
-
-    from scripts.vrs_reader import VRSReader
-
-    with VRSReader(output_vrs) as reader:
-        assert reader.get_stream_ids() == [1001, 1002, 1003, 1004]
-        assert reader.read_configuration(1001)["encoding"] == "rgb8"
-        assert reader.get_record_count(1001) == 1
-        assert reader.get_record_count(1002) == 1
-        assert reader.get_record_count(1003) == 1
-        assert reader.get_record_count(1004) == 1
+    reader = pyvrs.SyncVRSReader(path)
+    reader.set_image_conversion(pyvrs.ImageConversion.OFF)
+    counts = dict.fromkeys(config, 0)
+    configuration_ids = set()
+    try:
+        for tags in reader.stream_tags.values():
+            assert tags[SCHEMA_VERSION_TAG] == SCHEMA_VERSION
+            logical_id = int(tags[USER_STREAM_ID_TAG])
+            assert json.loads(tags[CONFIG_JSON_TAG]) == config[logical_id]
+        for record in reader:
+            tags = reader.stream_tags[record.stream_id]
+            logical_id = int(tags[USER_STREAM_ID_TAG])
+            if record.record_type == "configuration":
+                configuration_ids.add(logical_id)
+                continue
+            if record.record_type != "data":
+                continue
+            assert record.timestamp == (0.0, 0.033)[counts[logical_id]]
+            counts[logical_id] += 1
+            if logical_id in (1001, 1002):
+                assert tags[PAYLOAD_ENCODING_TAG] == NATIVE_IMAGE
+                expected = color if logical_id == 1001 else depth
+                image = np.asarray(record.image_blocks[0])
+                assert image.shape == expected.shape
+                assert image.dtype == expected.dtype
+                np.testing.assert_array_equal(image, expected)
+            else:
+                assert tags[PAYLOAD_ENCODING_TAG] == IMU_VECTOR
+                assert record.n_image_blocks == 0
+                expected_vector = accel if logical_id == 1003 else gyro
+                assert record.metadata_blocks[0]["doubles"] == list(expected_vector)
+    finally:
+        reader.close()
+    assert configuration_ids == set(config)
+    assert counts == {1001: 2, 1002: 2, 1003: 2, 1004: 2, 2001: 0}

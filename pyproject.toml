@@ -27,6 +27,7 @@ python_functions = ["test_*"]
 addopts = "-v --cov=scripts --cov-report=term-missing"
 markers = [
     "integration: requires a real RealSense ROSbag file",
+    "e2e: generates a synthetic ROSbag and converts it using the official VRS implementation",
     "slow: long-running conversion checks",
 ]
 
