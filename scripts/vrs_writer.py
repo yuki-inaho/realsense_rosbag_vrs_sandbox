@@ -13,12 +13,26 @@ import json
 import math
 import struct
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
+from scripts.image_codec_storage import (
+    CODEC_IMAGE,
+    CODEC_SCHEMA_VERSION,
+    IMAGE_CODEC_TAG,
+    encode_payload_text,
+)
+from scripts.image_codecs import (
+    CodecRegistry,
+    CodecSpec,
+    ImageCodecDescriptor,
+    ImageEncoder,
+    ImageSpec,
+    default_codec_registry,
+    encode_pixels,
+)
 from scripts.vrs_schema import (
     CONFIG_JSON_TAG,
     IMU_VECTOR,
@@ -39,18 +53,6 @@ _MAX_BACKGROUND_QUEUE_BYTES = 64 * 1024 * 1024
 _BACKGROUND_QUEUE_TIMEOUT_SECONDS = 30.0
 _MAX_STREAM_ID = (1 << 31) - 1
 
-# ROS image encoding -> official VRS pixel format, little-endian dtype, channels.
-_IMAGE_ENCODINGS = {
-    "rgb8": ("RGB8", "u1", 3),
-    "bgr8": ("BGR8", "u1", 3),
-    "rgba8": ("RGBA8", "u1", 4),
-    "mono8": ("GREY8", "u1", 1),
-    "8UC1": ("GREY8", "u1", 1),
-    "mono16": ("GREY16", "<u2", 1),
-    "16UC1": ("GREY16", "<u2", 1),
-    "32FC1": ("DEPTH32F", "<f4", 1),
-}
-
 
 def load_official_writer_backend() -> tuple[str, type[Any], Any]:
     """Return the official native writer without patching ``pyvrs`` exports."""
@@ -59,30 +61,14 @@ def load_official_writer_backend() -> tuple[str, type[Any], Any]:
     return "vrsbindings.Writer", vrsbindings.Writer, vrsbindings
 
 
-@dataclass(frozen=True)
-class _ImageSpec:
-    width: int
-    height: int
-    pixel_format: str
-    dtype: str
-    channels: int
-
-    @property
-    def byte_count(self) -> int:
-        return self.width * self.height * self.channels * int(np.dtype(self.dtype).itemsize)
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        dimensions = (self.height, self.width)
-        return dimensions if self.channels == 1 else (*dimensions, self.channels)
-
-
 @dataclass
 class _StreamState:
     name: str
     config_json: str = "{}"
     payload_encoding: str = OPAQUE_BYTES
-    image_spec: _ImageSpec | None = None
+    image_spec: ImageSpec | None = None
+    image_descriptor: ImageCodecDescriptor | None = None
+    image_encoder: ImageEncoder | None = None
     stream: Any = None
     data_format: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -97,7 +83,11 @@ class _Payload:
 
 
 class VRSWriter:
-    """Write real images and typed IMU metadata using official VRS factories.
+    """Write images and typed IMU metadata using official VRS factories.
+
+    ``image_codecs`` selects an independent codec per logical stream ID. Omitted
+    streams retain native raw images and schema 2. Encoded images use the explicit
+    schema-3 carrier; ``compression`` still controls only VRS record compression.
 
     ``add_stream`` and ``write_configuration`` must precede the first
     ``write_data`` call. Data timestamps are globally nondecreasing; equal
@@ -118,6 +108,8 @@ class VRSWriter:
         *,
         flush_bytes: int = _DEFAULT_FLUSH_BYTES,
         flush_records: int = _DEFAULT_FLUSH_RECORDS,
+        image_codecs: Mapping[int, CodecSpec] | None = None,
+        codec_registry: CodecRegistry | None = None,
     ) -> None:
         if isinstance(filepath, str):
             filepath = Path(filepath)
@@ -126,6 +118,12 @@ class VRSWriter:
         for name, value in (("flush_bytes", flush_bytes), ("flush_records", flush_records)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        self._image_codecs = dict(image_codecs or {})
+        for stream_id, codec in self._image_codecs.items():
+            self._validate_stream_id(stream_id)
+            if not isinstance(codec, CodecSpec):
+                raise ValueError("image_codecs values must be CodecSpec instances")
+        self._codec_registry = (codec_registry or default_codec_registry()).copy()
 
         self.backend_name, writer_cls, self._bindings = load_official_writer_backend()
         self._compression_preset = self._resolve_compression(compression)
@@ -166,7 +164,7 @@ class VRSWriter:
         self._stream_states[stream_id] = _StreamState(name=stream_name.split("|id:", maxsplit=1)[0])
 
     def write_configuration(self, stream_id: int, config_data: dict[str, Any]) -> None:
-        """Snapshot stream configuration and select its typed payload encoding."""
+        """Snapshot sensor settings; validate and select the image codec before file creation."""
         self._validate_setup()
         state = self._state_for(stream_id)
         if not isinstance(config_data, dict):
@@ -178,18 +176,29 @@ class VRSWriter:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"config_data is not JSON-serializable: {exc}") from exc
 
+        descriptor = None
+        encoder = None
         image_keys = {"width", "height", "encoding"}
         if image_keys <= config_data.keys():
             spec = self._image_spec(config_data)
-            encoding = NATIVE_IMAGE
-        elif config_data.get("sensor_type") in ("accelerometer", "gyroscope"):
-            spec = None
-            encoding = IMU_VECTOR
+            codec = self._image_codecs.get(stream_id, CodecSpec())
+            encoder, lossless = self._codec_registry.encoder(codec, spec)
+            encoding = NATIVE_IMAGE if (codec.name, codec.version) == ("raw", 1) else CODEC_IMAGE
+            if encoding == CODEC_IMAGE:
+                descriptor = ImageCodecDescriptor(spec, codec, lossless)
         else:
+            if stream_id in self._image_codecs:
+                raise ValueError(f"Image codec selected for non-image stream {stream_id}")
             spec = None
-            encoding = OPAQUE_BYTES
+            encoding = (
+                IMU_VECTOR
+                if config_data.get("sensor_type") in ("accelerometer", "gyroscope")
+                else OPAQUE_BYTES
+            )
         state.config_json = serialized
         state.image_spec = spec
+        state.image_descriptor = descriptor
+        state.image_encoder = encoder
         state.payload_encoding = encoding
 
     def write_data(self, stream_id: int, timestamp: float, data: bytes | list[int]) -> None:
@@ -260,19 +269,31 @@ class VRSWriter:
     def _start(self) -> None:
         if self._started:
             return
-        self._writer.setTag(SCHEMA_VERSION_TAG, SCHEMA_VERSION)
+        for stream_id in self._image_codecs:
+            if self._state_for(stream_id).image_spec is None:
+                raise ValueError(f"Image configuration missing for stream {stream_id}")
+        file_version = (
+            CODEC_SCHEMA_VERSION
+            if any(s.payload_encoding == CODEC_IMAGE for s in self._stream_states.values())
+            else SCHEMA_VERSION
+        )
+        self._writer.setTag(SCHEMA_VERSION_TAG, file_version)
         for stream_id, state in self._stream_states.items():
-            factory = "sample_with_image" if state.image_spec is not None else "sample"
+            native_image = state.payload_encoding == NATIVE_IMAGE
+            factory = "sample_with_image" if native_image else "sample"
             stream = self._writer.createStream(factory)
             stream.setCompression(self._compression_preset)
+            version = CODEC_SCHEMA_VERSION if state.image_descriptor else SCHEMA_VERSION
             for key, value in (
-                (SCHEMA_VERSION_TAG, SCHEMA_VERSION),
+                (SCHEMA_VERSION_TAG, version),
                 (USER_STREAM_ID_TAG, str(stream_id)),
                 (USER_STREAM_NAME_TAG, state.name),
                 (CONFIG_JSON_TAG, state.config_json),
                 (PAYLOAD_ENCODING_TAG, state.payload_encoding),
             ):
                 stream.setTag(key, value)
+            if state.image_descriptor is not None:
+                stream.setTag(IMAGE_CODEC_TAG, state.image_descriptor.to_json())
             configuration = stream.createRecordFormat(self._bindings.RecordType.CONFIGURATION)
             members = configuration.getMembers()[0]
             spec = state.image_spec
@@ -389,7 +410,12 @@ class VRSWriter:
                     f"Image payload is {len(payload)} bytes; expected {spec.byte_count} "
                     f"for {spec.width}x{spec.height} {spec.pixel_format}"
                 )
-            image = np.frombuffer(payload, dtype=np.dtype(spec.dtype)).reshape(spec.shape)
+            image = spec.array_from_bytes(payload)
+            if state.payload_encoding == CODEC_IMAGE:
+                if state.image_encoder is None:
+                    raise RuntimeError("Image encoder has not been configured")
+                encoded = encode_payload_text(encode_pixels(state.image_encoder, image, spec))
+                return _Payload(byte_count=len(encoded), text=encoded)
             return _Payload(byte_count=len(payload), image=image)
         if state.payload_encoding == IMU_VECTOR:
             if len(payload) != 24:
@@ -400,13 +426,5 @@ class VRSWriter:
         return _Payload(byte_count=len(encoded), text=encoded)
 
     @staticmethod
-    def _image_spec(config: dict[str, Any]) -> _ImageSpec:
-        for key in ("width", "height"):
-            value = config[key]
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < (1 << 32):
-                raise ValueError(f"Image {key} must be a positive uint32 integer")
-        encoding = config["encoding"]
-        if not isinstance(encoding, str) or encoding not in _IMAGE_ENCODINGS:
-            raise ValueError(f"Unsupported image encoding: {encoding!r}")
-        pixel_format, dtype, channels = _IMAGE_ENCODINGS[encoding]
-        return _ImageSpec(config["width"], config["height"], pixel_format, dtype, channels)
+    def _image_spec(config: dict[str, Any]) -> ImageSpec:
+        return ImageSpec.from_config(config)
