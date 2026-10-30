@@ -109,7 +109,9 @@ class ImageSpec:
             or image.dtype.kind != expected.kind
             or image.dtype.itemsize != expected.itemsize
         ):
-            raise ImageCodecError(f"Decoded/encoded pixels must have shape {self.shape}, {expected}")
+            raise ImageCodecError(
+                f"Decoded/encoded pixels must have shape {self.shape}, {expected}"
+            )
 
 
 @dataclass(frozen=True)
@@ -129,7 +131,9 @@ class CodecSpec:
             raise ImageCodecError("Codec options must be a mapping")
         snapshot = dict(self.options)
         for key, value in snapshot.items():
-            if not isinstance(key, str) or not isinstance(value, (str, int, float, bool, type(None))):
+            if not isinstance(key, str) or not isinstance(
+                value, (str, int, float, bool, type(None))
+            ):
                 raise ImageCodecError("Codec options require string keys and primitive JSON values")
             if isinstance(value, float) and not math.isfinite(value):
                 raise ImageCodecError("Codec options must be finite")
@@ -199,7 +203,9 @@ class CodecRegistry:
         try:
             factory, lossless = self._encoders[(codec.name, codec.version)]
         except KeyError as exc:
-            raise ImageCodecError(f"Unsupported image encoder: {codec.name}@{codec.version}") from exc
+            raise ImageCodecError(
+                f"Unsupported image encoder: {codec.name}@{codec.version}"
+            ) from exc
         # Lossy depth needs a future explicit quantization/error-budget contract.
         if image.role == "depth" and not lossless:
             raise ImageCodecError("Lossy depth codecs are not enabled")
@@ -211,7 +217,9 @@ class CodecRegistry:
         try:
             factory = self._decoders[(codec.name, codec.version)]
         except KeyError as exc:
-            raise ImageCodecError(f"Unsupported image decoder: {codec.name}@{codec.version}") from exc
+            raise ImageCodecError(
+                f"Unsupported image decoder: {codec.name}@{codec.version}"
+            ) from exc
         decoder = factory(codec)
         decoder.validate(image)
         return decoder

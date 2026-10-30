@@ -33,7 +33,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 def _run_cli(bag, vrs, *options):
     return subprocess.run(
         [sys.executable, "convert_to_vrs.py", str(bag), str(vrs), *options],
-        cwd=_ROOT, capture_output=True, text=True, timeout=60, check=False,
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
 
 
@@ -86,7 +90,9 @@ def _independent_read(vrs, expected, color_codec, depth_codec):
                 assert descriptor["lossless"] == (codec != "jpeg")
                 payload = base64.b64decode(record.metadata_blocks[0]["some_string"], validate=True)
                 assert payload.startswith(b"\x89PNG" if codec == "png" else b"\xff\xd8")
-                restored = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                restored = cv2.imdecode(
+                    np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                )
                 assert restored is not None
                 if stream == 1001:
                     restored = cv2.cvtColor(restored, cv2.COLOR_BGR2RGB)
@@ -108,10 +114,17 @@ def _independent_read(vrs, expected, color_codec, depth_codec):
 
 @pytest.mark.e2e
 @pytest.mark.parametrize("record_compression", ["none", "lz4", "zstd"])
-@pytest.mark.parametrize("color_codec,depth_codec", [
-    ("raw", "raw"), ("png", "png"), ("jpeg", "png"),
-    ("png", "raw"), ("raw", "png"), ("jpeg", "raw"),
-])
+@pytest.mark.parametrize(
+    "color_codec,depth_codec",
+    [
+        ("raw", "raw"),
+        ("png", "png"),
+        ("jpeg", "png"),
+        ("png", "raw"),
+        ("raw", "png"),
+        ("jpeg", "raw"),
+    ],
+)
 def test_independent_codecs_real_bag_cli_official_reader(
     tmp_path, record_compression, color_codec, depth_codec
 ):
@@ -119,8 +132,13 @@ def test_independent_codecs_real_bag_cli_official_reader(
     bag = write_synthetic_rosbag(tmp_path / "images.bag", spec)
     output = tmp_path / "images.vrs"
     options = [
-        "--imu", "--compression", record_compression,
-        "--color-codec", color_codec, "--depth-codec", depth_codec,
+        "--imu",
+        "--compression",
+        record_compression,
+        "--color-codec",
+        color_codec,
+        "--depth-codec",
+        depth_codec,
     ]
     if color_codec == "jpeg":
         options += ["--color-codec-options", '{"quality":90}']
@@ -154,7 +172,9 @@ def test_independent_codecs_real_bag_cli_official_reader(
 
 @pytest.mark.e2e
 def test_png_real_bag_normalizes_row_padding_and_big_endian(tmp_path):
-    spec = SyntheticBagSpec(width=8, height=6, frame_count=2, row_padding_bytes=4, depth_bigendian=True)
+    spec = SyntheticBagSpec(
+        width=8, height=6, frame_count=2, row_padding_bytes=4, depth_bigendian=True
+    )
     bag = write_synthetic_rosbag(tmp_path / "padded.bag", spec)
     output = tmp_path / "padded.vrs"
     result = _run_cli(bag, output, "--color-codec", "png", "--depth-codec", "png")
@@ -162,12 +182,15 @@ def test_png_real_bag_normalizes_row_padding_and_big_endian(tmp_path):
     _independent_read(output, _original_images(bag), "png", "png")
 
 
-@pytest.mark.parametrize("options", [
-    ["--depth-codec", "jpeg"],
-    ["--color-codec", "png", "--color-codec-options", '{"quality":90}'],
-    ["--color-codec-options", "[]"],
-    ["--depth-codec", "png", "--depth-codec-options", '{"compression_level":99}'],
-])
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--depth-codec", "jpeg"],
+        ["--color-codec", "png", "--color-codec-options", '{"quality":90}'],
+        ["--color-codec-options", "[]"],
+        ["--depth-codec", "png", "--depth-codec-options", '{"compression_level":99}'],
+    ],
+)
 def test_bad_cli_options_fail_without_output(tmp_path, options):
     bag = write_synthetic_rosbag(tmp_path / "invalid.bag", SyntheticBagSpec(width=8, height=6))
     output = tmp_path / "invalid.vrs"
@@ -201,7 +224,7 @@ class _IndependentDepthDecoder:
     def decode(self, payload, image):
         if not payload.startswith(b"TEST-DEPTH-1\0"):
             raise ImageCodecError("Invalid example depth header")
-        return image.array_from_bytes(zlib.decompress(payload[len(b"TEST-DEPTH-1\0"): ]))
+        return image.array_from_bytes(zlib.decompress(payload[len(b"TEST-DEPTH-1\0") :]))
 
 
 @pytest.mark.parametrize("encoding", ["16UC1", "32FC1"])
@@ -214,9 +237,13 @@ def test_injected_depth_encoder_and_separate_decoder_roundtrip(tmp_path, encodin
     if encoding == "16UC1":
         pixels = np.array([0, 1, 255, 256, 12345, 65535], dtype="<u2").reshape(2, 3)
     else:
-        bits = np.array([0, 0x80000000, 0x7FC00001, 0x7F800000, 0xFF800000, 0x3F800000], dtype="<u4")
+        bits = np.array(
+            [0, 0x80000000, 0x7FC00001, 0x7F800000, 0xFF800000, 0x3F800000], dtype="<u4"
+        )
         pixels = bits.view("<f4").reshape(2, 3)
-    with VRSWriter(output, image_codecs={1002: spec}, codec_registry=encoders, flush_records=1) as writer:
+    with VRSWriter(
+        output, image_codecs={1002: spec}, codec_registry=encoders, flush_records=1
+    ) as writer:
         writer.add_stream(1002, "depth")
         writer.write_configuration(1002, config)
         for timestamp in (0.0, 0.0, 1.0):

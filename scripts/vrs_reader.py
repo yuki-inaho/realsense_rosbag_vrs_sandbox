@@ -329,7 +329,9 @@ class VRSReader:
                     raise ImageCodecError("Invalid encoded-image record blocks")
                 if image_decoder is None:
                     VRSReader._codec_descriptor(tags)
-                    image_decoder = ImageRecordDecoder(tags[IMAGE_CODEC_TAG], default_codec_registry())
+                    image_decoder = ImageRecordDecoder(
+                        tags[IMAGE_CODEC_TAG], default_codec_registry()
+                    )
                 return image_decoder.decode(metadata.get(OPAQUE_BYTES_FIELD))
             if encoding == IMU_VECTOR:
                 values = metadata.get(IMU_VECTOR_FIELD, ())

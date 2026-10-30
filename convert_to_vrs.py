@@ -38,7 +38,7 @@ Examples:
   ./convert_to_vrs.py input.bag output.vrs --imu
 
   # Lossy color and lossless uint16 depth, with independent VRS record compression
-  ./convert_to_vrs.py input.bag output.vrs --imu --color-codec jpeg --depth-codec png --compression zstd
+  ./convert_to_vrs.py input.bag output.vrs --color-codec jpeg --depth-codec png --compression zstd
 
   # Codec-specific options are recorded in the file for automatic restoration
   ./convert_to_vrs.py input.bag output.vrs --color-codec jpeg --color-codec-options '{"quality":90}'
@@ -49,27 +49,42 @@ or register a lossless depth codec through the Python API. See docs/IMAGE_CODECS
     )
     parser.add_argument("input_bag", type=Path, help="ROS1 .bag file or ROS2 bag directory")
     parser.add_argument("output_vrs", type=Path, help="Output VRS file path")
-    parser.add_argument("--imu", "-i", action="store_true", help="Include IMU and device information")
     parser.add_argument(
-        "--compression", "-c", choices=["lz4", "zstd", "none"], default="lz4",
+        "--imu", "-i", action="store_true", help="Include IMU and device information"
+    )
+    parser.add_argument(
+        "--compression",
+        "-c",
+        choices=["lz4", "zstd", "none"],
+        default="lz4",
         help="VRS record compression, independent of image coding (default: lz4)",
     )
     parser.add_argument(
-        "--color-codec", choices=["raw", "png", "jpeg"], default="raw",
+        "--color-codec",
+        choices=["raw", "png", "jpeg"],
+        default="raw",
         help="Color image codec (default: raw; JPEG is lossy)",
     )
     parser.add_argument(
-        "--depth-codec", choices=["raw", "png"], default="raw",
+        "--depth-codec",
+        choices=["raw", "png"],
+        default="raw",
         help="Lossless depth image codec (default: raw)",
     )
     for role in ("color", "depth"):
         parser.add_argument(
-            f"--{role}-codec-options", type=_codec_options, default={}, metavar="JSON",
-            help="JSON options: JPEG quality 1..100; PNG compression_level 0..9; raw has no options",
+            f"--{role}-codec-options",
+            type=_codec_options,
+            default={},
+            metavar="JSON",
+            help="JPEG quality 1..100; PNG compression_level 0..9; raw accepts no options",
         )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Detailed progress information")
     parser.add_argument(
-        "--version", action="version",
+        "--verbose", "-v", action="store_true", help="Detailed progress information"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
         version=f"%(prog)s {__version__} (official VRS writer, schemas 2/3)",
     )
     args = parser.parse_args()

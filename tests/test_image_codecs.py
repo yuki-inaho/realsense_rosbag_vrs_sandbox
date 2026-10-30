@@ -51,7 +51,9 @@ def test_raw_float_depth_preserves_nan_inf_signed_zero_bits():
     pixels = bits.view("<f4").reshape(spec.shape)
     registry, codec = default_codec_registry(), CodecSpec()
     encoder, _ = registry.encoder(codec, spec)
-    restored = decode_pixels(registry.decoder(codec, spec), encode_pixels(encoder, pixels, spec), spec)
+    restored = decode_pixels(
+        registry.decoder(codec, spec), encode_pixels(encoder, pixels, spec), spec
+    )
     assert restored.tobytes() == pixels.tobytes()
 
 
@@ -70,21 +72,33 @@ def test_jpeg_is_explicitly_lossy_with_bounded_fixture_error(encoding):
     assert np.abs(restored.astype(float) - pixels).mean() < 3
 
 
-@pytest.mark.parametrize("name,encoding,role", [
-    ("jpeg", "16UC1", "depth"), ("jpeg", "32FC1", "depth"),
-    ("jpeg", "mono8", "depth"), ("jpeg", "rgba8", "color"),
-    ("png", "32FC1", "depth"),
-])
+@pytest.mark.parametrize(
+    "name,encoding,role",
+    [
+        ("jpeg", "16UC1", "depth"),
+        ("jpeg", "32FC1", "depth"),
+        ("jpeg", "mono8", "depth"),
+        ("jpeg", "rgba8", "color"),
+        ("png", "32FC1", "depth"),
+    ],
+)
 def test_no_implicit_depth_quantization_or_alpha_loss(name, encoding, role):
     with pytest.raises(ImageCodecError):
         default_codec_registry().encoder(CodecSpec(name), ImageSpec(8, 6, encoding, role))
 
 
-@pytest.mark.parametrize("name,options", [
-    ("raw", {"quality": 95}), ("png", {"quality": 95}),
-    ("png", {"compression_level": 10}), ("png", {"compression_level": True}),
-    ("jpeg", {"quality": 0}), ("jpeg", {"quality": 101}), ("jpeg", {"quality": 90.0}),
-])
+@pytest.mark.parametrize(
+    "name,options",
+    [
+        ("raw", {"quality": 95}),
+        ("png", {"quality": 95}),
+        ("png", {"compression_level": 10}),
+        ("png", {"compression_level": True}),
+        ("jpeg", {"quality": 0}),
+        ("jpeg", {"quality": 101}),
+        ("jpeg", {"quality": 90.0}),
+    ],
+)
 def test_invalid_codec_options_fail(name, options):
     with pytest.raises(ImageCodecError):
         default_codec_registry().encoder(CodecSpec(name, options=options), ImageSpec(8, 6, "rgb8"))
@@ -101,12 +115,20 @@ def test_specs_are_immutable_snapshots_and_roundtrip_json():
         codec.options["quality"] = 20
 
 
-@pytest.mark.parametrize("change", [
-    {"descriptor_version": 2}, {"descriptor_version": True},
-    {"lossless": "false"}, {"codec": {"name": "png", "version": 1}}, {"image": []},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"descriptor_version": 2},
+        {"descriptor_version": True},
+        {"lossless": "false"},
+        {"codec": {"name": "png", "version": 1}},
+        {"image": []},
+    ],
+)
 def test_invalid_descriptor(change):
-    value = json.loads(ImageCodecDescriptor(ImageSpec(8, 6, "rgb8"), CodecSpec("png"), True).to_json())
+    value = json.loads(
+        ImageCodecDescriptor(ImageSpec(8, 6, "rgb8"), CodecSpec("png"), True).to_json()
+    )
     value.update(change)
     with pytest.raises(ImageCodecError):
         ImageCodecDescriptor.from_json(json.dumps(value))
@@ -169,9 +191,16 @@ def test_no_unknown_codec_fallback_and_no_registry_global_state():
         snapshot.decoder(CodecSpec("example"), spec)
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"width": True}, {"width": 0}, {"width": 1 << 31}, {"encoding": "bad"}, {"role": "bad"},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"width": True},
+        {"width": 0},
+        {"width": 1 << 31},
+        {"encoding": "bad"},
+        {"role": "bad"},
+    ],
+)
 def test_invalid_image_specs(kwargs):
     fields = {"width": 8, "height": 6, "encoding": "16UC1"}
     fields.update(kwargs)
@@ -179,16 +208,25 @@ def test_invalid_image_specs(kwargs):
         ImageSpec(**fields)
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"version": True}, {"version": 0}, {"name": "../plugin"},
-    {"options": {"x": float("nan")}}, {"options": {"x": []}}, {"options": []},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"version": True},
+        {"version": 0},
+        {"name": "../plugin"},
+        {"options": {"x": float("nan")}},
+        {"options": {"x": []}},
+        {"options": []},
+    ],
+)
 def test_invalid_codec_specs(kwargs):
     with pytest.raises(ImageCodecError):
         CodecSpec(**kwargs)
 
 
-@pytest.mark.parametrize("bad_output", [np.zeros((6, 8), dtype=np.uint8), np.zeros((3, 4), dtype=np.uint16)])
+@pytest.mark.parametrize(
+    "bad_output", [np.zeros((6, 8), dtype=np.uint8), np.zeros((3, 4), dtype=np.uint16)]
+)
 def test_decoder_cannot_silently_change_shape_or_depth_type(bad_output):
     class BadDecoder:
         def decode(self, payload, image):
