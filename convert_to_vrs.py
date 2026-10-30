@@ -1,150 +1,111 @@
 #!/usr/bin/env python3
-"""
-RealSense ROSbag to VRS Converter
-
-Convert RealSense D435i ROSbag files to VRS (Virtual Reality Stream) format.
-Supports Color and Depth streams with camera calibration parameters.
-
-Usage:
-    ./convert_to_vrs.py input.bag output.vrs
-    ./convert_to_vrs.py input.bag output.vrs --verbose
-    ./convert_to_vrs.py input.bag output.vrs --compression zstd
-"""
+"""Convert RealSense ROSbags with independently selected color/depth image codecs."""
 
 import argparse
+import json
 import sys
+from functools import partial
 from pathlib import Path
+from typing import Any
 
 from scripts import __version__
+from scripts.image_codecs import CodecSpec
 from scripts.rosbag_to_vrs_converter import (
     RosbagToVRSConverter,
     create_rgbd_config,
     create_rgbd_imu_config,
 )
+from scripts.vrs_writer import VRSWriter
+
+
+def _codec_options(text: str) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+        # The value object validates and snapshots primitive JSON options.
+        return dict(CodecSpec(options=value).options)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"Codec options must be a JSON object: {exc}") from exc
 
 
 def main() -> int:
-    """Main entry point for ROSbag to VRS conversion"""
+    """Main entry point. Image coding and VRS record compression are independent."""
     parser = argparse.ArgumentParser(
         description="Convert RealSense D435i ROSbag to VRS format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Convert ROSbag to VRS
-  ./convert_to_vrs.py data/rosbag/sample.bag output.vrs
+  # Preserve the original raw-image storage (default)
+  ./convert_to_vrs.py input.bag output.vrs --imu
 
-  # Convert with verbose output
-  ./convert_to_vrs.py data/rosbag/sample.bag output.vrs --verbose
+  # Lossy color and lossless uint16 depth, with independent VRS record compression
+  ./convert_to_vrs.py input.bag output.vrs --imu --color-codec jpeg --depth-codec png --compression zstd
 
-  # Specify compression algorithm (lz4, zstd, or none)
-  ./convert_to_vrs.py data/rosbag/sample.bag output.vrs --compression zstd
+  # Codec-specific options are recorded in the file for automatic restoration
+  ./convert_to_vrs.py input.bag output.vrs --color-codec jpeg --color-codec-options '{"quality":90}'
 
-Supported Data:
-  - Color Image: RGB camera stream with intrinsic parameters
-  - Depth Image: Depth camera stream with intrinsic parameters and depth scale
-  - Transform: Camera extrinsic parameters (included by default)
-  - IMU Data: Accelerometer and Gyroscope (optional, use --imu)
-  - Camera Info: K matrix, distortion coefficients, distortion model
-
-Features:
-  - Automatic ROS1/ROS2 bag detection
-  - LZ4/ZSTD compression support
-  - Camera calibration parameter preservation
-  - Progress reporting and statistics
+Depth codecs must preserve values. PNG does not support float32 depth; use raw
+or register a lossless depth codec through the Python API. See docs/IMAGE_CODECS.md.
         """,
     )
-
+    parser.add_argument("input_bag", type=Path, help="ROS1 .bag file or ROS2 bag directory")
+    parser.add_argument("output_vrs", type=Path, help="Output VRS file path")
+    parser.add_argument("--imu", "-i", action="store_true", help="Include IMU and device information")
     parser.add_argument(
-        "input_bag",
-        type=Path,
-        help="Input ROSbag file (.bag for ROS1, directory for ROS2)",
+        "--compression", "-c", choices=["lz4", "zstd", "none"], default="lz4",
+        help="VRS record compression, independent of image coding (default: lz4)",
     )
-
     parser.add_argument(
-        "output_vrs",
-        type=Path,
-        help="Output VRS file path (.vrs extension)",
+        "--color-codec", choices=["raw", "png", "jpeg"], default="raw",
+        help="Color image codec (default: raw; JPEG is lossy)",
     )
-
     parser.add_argument(
-        "--imu",
-        "-i",
-        action="store_true",
-        help="Include IMU streams (Accelerometer and Gyroscope)",
+        "--depth-codec", choices=["raw", "png"], default="raw",
+        help="Lossless depth image codec (default: raw)",
     )
-
+    for role in ("color", "depth"):
+        parser.add_argument(
+            f"--{role}-codec-options", type=_codec_options, default={}, metavar="JSON",
+            help="JSON options: JPEG quality 1..100; PNG compression_level 0..9; raw has no options",
+        )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Detailed progress information")
     parser.add_argument(
-        "--compression",
-        "-c",
-        choices=["lz4", "zstd", "none"],
-        default="lz4",
-        help="Compression algorithm (default: lz4)",
+        "--version", action="version",
+        version=f"%(prog)s {__version__} (official VRS writer, schemas 2/3)",
     )
-
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose output with detailed progress information",
-    )
-
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__} (official VRS writer, schema 2)",
-    )
-
     args = parser.parse_args()
-
-    # Validate input
     if not args.input_bag.exists():
         print(f"Error: Input ROSbag not found: {args.input_bag}", file=sys.stderr)
-        print("\nTip: Check the file path and ensure the bag file exists.", file=sys.stderr)
         return 1
 
-    # Create output directory if needed
-    output_dir = args.output_vrs.parent
-    if output_dir and not output_dir.exists():
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if args.verbose:
-            print(f"Created output directory: {output_dir}")
-
-    # Create converter configuration
-    if args.imu:
-        config = create_rgbd_imu_config(
-            compression=args.compression,
-            verbose=args.verbose,
-        )
-    else:
-        config = create_rgbd_config(
-            compression=args.compression,
-            verbose=args.verbose,
-        )
-
-    # Run conversion
     try:
-        converter = RosbagToVRSConverter(
-            args.input_bag,
-            args.output_vrs,
-            config,
+        args.output_vrs.parent.mkdir(parents=True, exist_ok=True)
+        config_factory = create_rgbd_imu_config if args.imu else create_rgbd_config
+        config = config_factory(compression=args.compression, verbose=args.verbose)
+        choices = {
+            "color": CodecSpec(args.color_codec, options=args.color_codec_options),
+            "depth": CodecSpec(args.depth_codec, options=args.depth_codec_options),
+        }
+        # The conversion layer remains codec-agnostic; its existing factory is
+        # the composition point. No hard-coded stream numbers are needed here.
+        writer_factory = partial(
+            VRSWriter,
+            compression=args.compression,
+            image_codecs={
+                stream.stream_id: choices[stream.stream_type]
+                for stream in config.topic_mapping.values()
+                if stream.stream_type in choices
+            },
         )
-
+        converter = RosbagToVRSConverter(
+            args.input_bag, args.output_vrs, config, writer_factory=writer_factory
+        )
         if args.verbose:
-            print("=" * 70)
-            print("🔄 Converting ROSbag to VRS")
-            print("=" * 70)
-            print(f"  Input:       {args.input_bag}")
-            print(f"  Output:      {args.output_vrs}")
-            print(f"  Compression: {args.compression}")
-            print("  Phase:       4A (Color + Depth)")
-            print("-" * 70)
-
+            print(f"Input: {args.input_bag}")
+            print(f"Output: {args.output_vrs}")
+            print(f"Record compression: {args.compression}")
+            print(f"Color codec: {args.color_codec}; depth codec: {args.depth_codec}")
         result = converter.convert()
-
-        # Print summary
-        print(f"\n{'=' * 70}")
-        print("✅ Conversion Complete!")
-        print(f"{'=' * 70}")
+        print("Conversion Complete!")
         print(f"  Input size:       {result.input_bag_size / 1024 / 1024:.2f} MB")
         print(f"  Output size:      {result.output_vrs_size / 1024 / 1024:.2f} MB")
         print(f"  Compression:      {result.compression_ratio:.2%}")
@@ -153,27 +114,17 @@ Features:
         print(f"  - Depth stream:   {result.messages_per_stream.get(1002, 0)} records")
         print(f"  Conversion time:  {result.conversion_time_sec:.2f}s")
         print(f"  Bag duration:     {result.duration_sec:.2f}s")
-        print(f"\n📄 Output file: {args.output_vrs}")
-        print("\nTo inspect the VRS file, run:")
-        print(f"  ./inspect_vrs.py {args.output_vrs}")
-
+        print(f"  Output file:      {args.output_vrs}")
         return 0
-
     except KeyboardInterrupt:
-        print("\n\n⚠️  Conversion cancelled by user.", file=sys.stderr)
+        print("Conversion cancelled by user.", file=sys.stderr)
         return 130
-    except Exception as e:
-        print(f"\n{'=' * 70}", file=sys.stderr)
-        print("❌ Conversion Failed", file=sys.stderr)
-        print(f"{'=' * 70}", file=sys.stderr)
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Conversion Failed: {exc}", file=sys.stderr)
         if args.verbose:
-            print("\nDetailed traceback:", file=sys.stderr)
             import traceback
 
             traceback.print_exc()
-        else:
-            print("\nTip: Run with --verbose for detailed error information.", file=sys.stderr)
         return 1
 
 

@@ -13,6 +13,20 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
+from scripts.image_codec_storage import (
+    CODEC_IMAGE,
+    CODEC_SCHEMA_VERSION,
+    IMAGE_CODEC_TAG,
+    ImageRecordDecoder,
+    decode_payload_text,
+)
+from scripts.image_codecs import (
+    CodecRegistry,
+    ImageCodecDescriptor,
+    ImageCodecError,
+    ImageSpec,
+    default_codec_registry,
+)
 from scripts.vrs_schema import (
     IMU_VECTOR,
     IMU_VECTOR_FIELD,
@@ -34,7 +48,8 @@ class VRSReader:
     """VRS file reader with Pythonic interface and context manager support.
 
     This class wraps the pyvrs.SyncVRSReader to provide a simple interface
-    for reading VRS files.
+    for reading VRS files. Encoded images are restored using the persisted codec
+    descriptor and an explicitly supplied registry (built-ins by default).
 
     Example:
         >>> with VRSReader("input.vrs") as reader:
@@ -44,17 +59,10 @@ class VRSReader:
         ...         print(record["timestamp"], record["data"])
     """
 
-    def __init__(self, filepath: Path | str) -> None:
-        """Initialize VRS reader and open VRS file.
-
-        Args:
-            filepath: Path to the VRS file to read (Path or str)
-
-        Raises:
-            FileNotFoundError: If file does not exist
-            ValueError: If filepath is invalid or file is not a valid VRS file
-            RuntimeError: If VRS file opening fails
-        """
+    def __init__(
+        self, filepath: Path | str, *, codec_registry: CodecRegistry | None = None
+    ) -> None:
+        """Open a VRS file. Custom codecs must be registered by trusted application code."""
         if isinstance(filepath, str):
             filepath = Path(filepath)
 
@@ -64,6 +72,7 @@ class VRSReader:
         if not filepath.exists():
             raise FileNotFoundError(f"VRS file not found: {filepath}")
 
+        self._codec_registry = (codec_registry or default_codec_registry()).copy()
         self._filepath = filepath
         self._reader: Any = None  # pyvrs.SyncVRSReader instance
         self._stream_id_mapping: dict[int, str] = {}  # user_id -> vrs_stream_id
@@ -239,17 +248,10 @@ class VRSReader:
             raise RuntimeError(f"Failed to read configuration for stream {stream_id}: {e}") from e
 
     def read_data_records(self, stream_id: int) -> Iterator[dict[str, Any]]:
-        """Read all data records for the specified stream.
+        """Yield timestamps and restored bytes; JPEG output is necessarily lossy.
 
-        Args:
-            stream_id: Target stream ID (user-specified)
-
-        Yields:
-            Dictionary with 'timestamp' and 'data' keys for each record
-
-        Raises:
-            ValueError: If stream_id doesn't exist
-            RuntimeError: If reader is not open or read fails
+        Existing native/legacy payloads keep their old interpretation. Codec
+        selection for new encoded images comes from the file, not caller guesses.
         """
         if self._reader is None:
             raise RuntimeError("VRS file is not open")
@@ -258,15 +260,17 @@ class VRSReader:
             raise ValueError(f"stream_id must be int, got {type(stream_id).__name__}")
 
         try:
-            # Convert user stream_id to VRS stream_id
             vrs_stream_id = self._get_vrs_stream_id(stream_id)
-
+            tags = self._stream_tags(vrs_stream_id)
+            decoder = None
+            if tags.get(PAYLOAD_ENCODING_TAG) == CODEC_IMAGE:
+                self._codec_descriptor(tags)
+                decoder = ImageRecordDecoder(tags[IMAGE_CODEC_TAG], self._codec_registry)
             for record in self._reader:
-                # Note: record.record_type is a string, not enum
                 if record.stream_id == vrs_stream_id and record.record_type == "data":
                     yield {
                         "timestamp": record.timestamp,
-                        "data": self._record_payload(record, self._stream_tags(vrs_stream_id)),
+                        "data": self._record_payload(record, tags, decoder),
                     }
         except ValueError:
             raise
@@ -274,14 +278,59 @@ class VRSReader:
             raise RuntimeError(f"Failed to read data records for stream {stream_id}: {e}") from e
 
     @staticmethod
-    def _record_payload(record: Any, tags: dict[str, str]) -> bytes:
+    def _codec_descriptor(tags: dict[str, str]) -> ImageCodecDescriptor:
+        if tags.get(SCHEMA_VERSION_TAG) != CODEC_SCHEMA_VERSION:
+            raise ImageCodecError("Encoded images require VRS sandbox schema 3")
+        try:
+            descriptor = ImageCodecDescriptor.from_json(tags[IMAGE_CODEC_TAG])
+            config = json.loads(tags["config_json"])
+            if descriptor.image != ImageSpec.from_config(config):
+                raise ImageCodecError("Codec descriptor disagrees with sensor configuration")
+            return descriptor
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ImageCodecError("Missing or invalid encoded-image stream tags") from exc
+
+    def read_encoded_image_records(self, stream_id: int) -> Iterator[dict[str, Any]]:
+        """Extract compressed bytes and their descriptor without needing the decoder plugin.
+
+        Only schema-3 encoded image streams support this method. It never returns
+        an undecoded buffer from ``read_data_records`` as though it were pixels.
+        """
+        if self._reader is None:
+            raise RuntimeError("VRS file is not open")
+        vrs_stream_id = self._get_vrs_stream_id(stream_id)
+        tags = self._stream_tags(vrs_stream_id)
+        if tags.get(PAYLOAD_ENCODING_TAG) != CODEC_IMAGE:
+            raise ImageCodecError("Stream does not contain encoded images")
+        descriptor = self._codec_descriptor(tags)
+        for record in self._reader:
+            if record.stream_id == vrs_stream_id and record.record_type == "data":
+                if record.n_metadata_blocks != 1 or record.n_image_blocks:
+                    raise ImageCodecError("Invalid encoded-image record blocks")
+                yield {
+                    "timestamp": record.timestamp,
+                    "descriptor": descriptor,
+                    "data": decode_payload_text(record.metadata_blocks[0][OPAQUE_BYTES_FIELD]),
+                }
+
+    @staticmethod
+    def _record_payload(
+        record: Any, tags: dict[str, str], image_decoder: ImageRecordDecoder | None = None
+    ) -> bytes:
         """Decode versioned sensor records and historical byte-oriented files."""
         metadata = record.metadata_blocks[0] if record.n_metadata_blocks else {}
         schema_version = tags.get(SCHEMA_VERSION_TAG)
         if schema_version is not None:
-            if schema_version != SCHEMA_VERSION:
+            if schema_version not in (SCHEMA_VERSION, CODEC_SCHEMA_VERSION):
                 raise ValueError(f"Unsupported VRS sandbox schema version: {schema_version}")
             encoding = tags.get(PAYLOAD_ENCODING_TAG)
+            if encoding == CODEC_IMAGE:
+                if record.n_metadata_blocks != 1 or record.n_image_blocks:
+                    raise ImageCodecError("Invalid encoded-image record blocks")
+                if image_decoder is None:
+                    VRSReader._codec_descriptor(tags)
+                    image_decoder = ImageRecordDecoder(tags[IMAGE_CODEC_TAG], default_codec_registry())
+                return image_decoder.decode(metadata.get(OPAQUE_BYTES_FIELD))
             if encoding == IMU_VECTOR:
                 values = metadata.get(IMU_VECTOR_FIELD, ())
                 if len(values) != 3:
