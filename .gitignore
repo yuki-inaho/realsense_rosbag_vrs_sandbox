@@ -26,17 +26,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Sample data files (large files)
-data/rosbag/d435i_walk_around.bag
-data/rosbag/d435i_walking.bag
-data/rosbag/sample_d435i.bag
+# Recordings and generated test data stay local; commit only their generators.
+*.bag
+*.vrs
 data/rosbag/d435i_sample_data.zip
 
 # VRS output files
 data/vrs/
 
-# Keep only LFS-tracked user data
-!data/rosbag/20251119_112125.bag
 third/vrs_install/
 pyvrs_writer/build/
 

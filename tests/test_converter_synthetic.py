@@ -127,7 +127,15 @@ class SyntheticReader:
 
     def deserialize(self, rawdata: bytes, msgtype: str) -> Any:
         if msgtype.endswith("Image"):
-            return SimpleNamespace(data=rawdata)
+            is_color = b"Color" in rawdata
+            return SimpleNamespace(
+                width=2,
+                height=2,
+                encoding="rgb8" if is_color else "16UC1",
+                step=6 if is_color else 4,
+                is_bigendian=0,
+                data=bytes(range(12 if is_color else 8)),
+            )
         if msgtype.endswith("CameraInfo"):
             return SimpleNamespace(
                 width=2,

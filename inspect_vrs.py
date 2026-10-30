@@ -59,7 +59,7 @@ Stream Information:
   - Depth scale (for depth streams)
   - Timestamp ranges
 
-Tip: This tool provides ROSbag-equivalent information display.
+Tip: This tool displays the sensor configuration preserved in the VRS file.
         """,
     )
 

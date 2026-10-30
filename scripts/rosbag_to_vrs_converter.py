@@ -5,6 +5,8 @@ Converts RealSense D435i ROSbag files to VRS format.
 Color + Depth (必須)
 """
 
+import math
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ except ImportError:
     raise ImportError("rosbags library is required. Install with: uv add rosbags")
 
 # VRS writer
+from scripts.image_payload import image_description, image_payload
 from scripts.rosbag_deserializer import deserialize_reader_message
 from scripts.vrs_writer import VRSWriter
 
@@ -77,7 +80,7 @@ class RosbagToVRSConverter:
         config: ConverterConfig,
         reader_factory: ReaderFactory | None = None,
         writer_factory: WriterFactory | None = None,
-    ):
+    ) -> None:
         """
         Initialize converter
 
@@ -92,10 +95,16 @@ class RosbagToVRSConverter:
         self._reader_factory = reader_factory
         self._writer_factory = writer_factory
 
-        # Statistics
-        self._stats: dict[str, Any] = {
+        self._stats: dict[str, Any] = {}
+        self._reset_statistics()
+
+    def _reset_statistics(self) -> None:
+        """Keep repeated conversions independent and release previous frame buffers."""
+        self._stats = {
             "total_messages": 0,
             "messages_per_stream": {},
+            "sample_headers": {},
+            "image_configurations": {},
             "camera_info_cache": {},  # Cache CameraInfo messages
             "transform_cache": {},  # Cache Transform messages
             "stream_info_cache": {},  # Cache StreamInfo messages
@@ -120,7 +129,10 @@ class RosbagToVRSConverter:
         if not self.rosbag_path.exists():
             raise FileNotFoundError(f"ROSbag file not found: {self.rosbag_path}")
 
-        start_time = time.time()
+        if self.rosbag_path.resolve() == self.vrs_path.resolve():
+            raise ValueError("Input ROSbag and output VRS must be different paths")
+        self._reset_statistics()
+        start_time = time.perf_counter()
 
         if self.config.verbose:
             print(f"Converting {self.rosbag_path} -> {self.vrs_path}")
@@ -132,29 +144,24 @@ class RosbagToVRSConverter:
         # Detect ROSbag format (ROS1 or ROS2)
         reader = self._open_rosbag()
 
-        # Create VRS writer
-        with self._create_writer() as writer:
-            # Create streams
-            self._create_streams(writer)
-
-            # Write configuration records (requires CameraInfo, Transform, and Info data from bag)
+        # Open the bag once. All schema/tag information must be collected before
+        # the official writer starts its asynchronous, bounded data writes.
+        with reader:
             self._cache_camera_info(reader)
+            self._cache_sample_headers(reader)
             self._cache_transforms(reader)
             self._cache_stream_info(reader)
             self._cache_device_info(reader)
             self._cache_sensor_info(reader)
             self._cache_options(reader)
-            self._write_configurations(writer)
+            duration_sec = self._calculate_bag_duration(reader)
+            with self._create_writer() as writer:
+                self._create_streams(writer)
+                self._write_configurations(writer)
+                self._process_messages(reader, writer)
 
-            # Process messages in temporal order
-            self._process_messages(reader, writer)
-
-        # Calculate statistics
         output_vrs_size = self.vrs_path.stat().st_size
-        conversion_time = time.time() - start_time
-
-        # Extract bag duration (first to last message timestamp)
-        duration_sec = self._calculate_bag_duration(reader)
+        conversion_time = time.perf_counter() - start_time
 
         result = ConversionResult(
             input_bag_size=input_bag_size,
@@ -238,22 +245,41 @@ class RosbagToVRSConverter:
             "/device_0/sensor_0/Depth_0/info/camera_info",
         ]
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic in camera_info_topics]
+        connections = [x for x in reader.connections if x.topic in camera_info_topics]
 
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                # Deserialize message
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            # Deserialize message
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
 
-                # Cache by topic
-                self._stats["camera_info_cache"][connection.topic] = msg
+            # Cache by topic
+            self._stats["camera_info_cache"][connection.topic] = msg
 
-                if self.config.verbose:
-                    print(f"Cached CameraInfo from {connection.topic}")
+            if self.config.verbose:
+                print(f"Cached CameraInfo from {connection.topic}")
 
-                # Stop after getting one message per topic
-                if len(self._stats["camera_info_cache"]) >= len(camera_info_topics):
-                    break
+            # Stop after getting one message per topic
+            if len(self._stats["camera_info_cache"]) >= len(camera_info_topics):
+                break
+
+    def _cache_sample_headers(self, reader: Any) -> None:
+        """Inspect initial image/IMU messages before freezing VRS configurations."""
+        topics = {
+            topic
+            for topic, stream in self.config.topic_mapping.items()
+            if stream.stream_type in {"color", "depth", "imu_accel", "imu_gyro"}
+        }
+        connections = [
+            connection for connection in reader.connections if connection.topic in topics
+        ]
+        if not connections:
+            return
+        for connection, _, rawdata in reader.messages(connections=connections):
+            if connection.topic not in self._stats["sample_headers"]:
+                self._stats["sample_headers"][connection.topic] = deserialize_reader_message(
+                    reader, rawdata, connection.msgtype
+                )
+            if len(self._stats["sample_headers"]) == len(connections):
+                break
 
     def _cache_transforms(self, reader: Any) -> None:
         """
@@ -265,28 +291,27 @@ class RosbagToVRSConverter:
         """
         transform_topics = ["/device_0/sensor_0/Depth_0/tf/0", "/device_0/sensor_1/Color_0/tf/0"]
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic in transform_topics]
+        connections = [x for x in reader.connections if x.topic in transform_topics]
 
-            # Transform topics may not exist in all bags (optional)
-            if not connections:
-                if self.config.verbose:
-                    print("No Transform topics found in ROSbag (skipping)")
-                return
+        # Transform topics may not exist in all bags (optional)
+        if not connections:
+            if self.config.verbose:
+                print("No Transform topics found in ROSbag (skipping)")
+            return
 
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                # Deserialize message
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            # Deserialize message
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
 
-                # Cache by topic
-                self._stats["transform_cache"][connection.topic] = msg
+            # Cache by topic
+            self._stats["transform_cache"][connection.topic] = msg
 
-                if self.config.verbose:
-                    print(f"Cached Transform from {connection.topic}")
+            if self.config.verbose:
+                print(f"Cached Transform from {connection.topic}")
 
-                # Stop after getting one message per topic (Transforms are static)
-                if len(self._stats["transform_cache"]) >= len(transform_topics):
-                    break
+            # Stop after getting one message per topic (Transforms are static)
+            if len(self._stats["transform_cache"]) >= len(transform_topics):
+                break
 
     def _cache_stream_info(self, reader: Any) -> None:
         """
@@ -305,21 +330,20 @@ class RosbagToVRSConverter:
             "/device_0/sensor_2/Gyro_0/info",
         ]
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic in stream_info_topics]
+        connections = [x for x in reader.connections if x.topic in stream_info_topics]
 
-            if not connections:
-                if self.config.verbose:
-                    print("No StreamInfo topics found in ROSbag (skipping)")
-                return
+        if not connections:
+            if self.config.verbose:
+                print("No StreamInfo topics found in ROSbag (skipping)")
+            return
 
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
-                self._stats["stream_info_cache"][connection.topic] = msg
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+            self._stats["stream_info_cache"][connection.topic] = msg
 
-                if self.config.verbose:
-                    stream_info = f"fps={msg.fps}, encoding={msg.encoding}"
-                    print(f"Cached StreamInfo from {connection.topic}: {stream_info}")
+            if self.config.verbose:
+                stream_info = f"fps={msg.fps}, encoding={msg.encoding}"
+                print(f"Cached StreamInfo from {connection.topic}: {stream_info}")
 
     def _cache_device_info(self, reader: Any) -> None:
         """
@@ -331,22 +355,21 @@ class RosbagToVRSConverter:
         device_info_topic = "/device_0/info"
         device_info_dict = {}
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic == device_info_topic]
+        connections = [x for x in reader.connections if x.topic == device_info_topic]
 
-            if not connections:
-                if self.config.verbose:
-                    print("No Device Info topics found in ROSbag (skipping)")
-                return
-
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
-                device_info_dict[msg.key] = msg.value
-
-            self._stats["device_info_cache"] = device_info_dict
-
+        if not connections:
             if self.config.verbose:
-                print(f"Cached Device Info ({len(device_info_dict)} key-value pairs)")
+                print("No Device Info topics found in ROSbag (skipping)")
+            return
+
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+            device_info_dict[msg.key] = msg.value
+
+        self._stats["device_info_cache"] = device_info_dict
+
+        if self.config.verbose:
+            print(f"Cached Device Info ({len(device_info_dict)} key-value pairs)")
 
     def _cache_sensor_info(self, reader: Any) -> None:
         """
@@ -363,20 +386,19 @@ class RosbagToVRSConverter:
             "/device_0/sensor_2/info",
         ]
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic in sensor_info_topics]
+        connections = [x for x in reader.connections if x.topic in sensor_info_topics]
 
-            if not connections:
-                if self.config.verbose:
-                    print("No Sensor Info topics found in ROSbag (skipping)")
-                return
+        if not connections:
+            if self.config.verbose:
+                print("No Sensor Info topics found in ROSbag (skipping)")
+            return
 
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
-                self._stats["sensor_info_cache"][connection.topic] = msg
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+            self._stats["sensor_info_cache"][connection.topic] = msg
 
-                if self.config.verbose:
-                    print(f"Cached Sensor Info from {connection.topic}: {msg.value}")
+            if self.config.verbose:
+                print(f"Cached Sensor Info from {connection.topic}: {msg.value}")
 
     def _cache_options(self, reader: Any) -> None:
         """
@@ -388,45 +410,46 @@ class RosbagToVRSConverter:
         """
         options_dict = {}  # {option_name: {sensor, value, description}}
 
-        with reader:
-            # Find all option topics
-            option_connections = [c for c in reader.connections if "/option/" in c.topic]
+        # Find all option topics
+        option_connections = [c for c in reader.connections if "/option/" in c.topic]
 
-            if not option_connections:
-                if self.config.verbose:
-                    print("No Options topics found in ROSbag (skipping)")
-                return
-
-            for connection, timestamp, rawdata in reader.messages(connections=option_connections):
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
-
-                # Parse topic: /device_0/sensor_X/option/OPTION_NAME/TYPE
-                parts = connection.topic.split("/")
-                if len(parts) < 6:
-                    continue  # Invalid topic format
-
-                sensor_id = parts[2]  # sensor_0, sensor_1, sensor_2
-                option_name = parts[4]  # Exposure, Gain, etc.
-                option_type = parts[5]  # value or description
-
-                # Initialize option entry if not exists
-                if option_name not in options_dict:
-                    options_dict[option_name] = {
-                        "sensor": sensor_id,
-                        "value": None,
-                        "description": None,
-                    }
-
-                # Store value or description
-                if option_type == "value":
-                    options_dict[option_name]["value"] = float(msg.data)
-                elif option_type == "description":
-                    options_dict[option_name]["description"] = str(msg.data)
-
-            self._stats["options_cache"] = options_dict
-
+        if not option_connections:
             if self.config.verbose:
-                print(f"Cached {len(options_dict)} Options")
+                print("No Options topics found in ROSbag (skipping)")
+            return
+
+        for connection, timestamp, rawdata in reader.messages(connections=option_connections):
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+
+            # Parse topic: /device_0/sensor_X/option/OPTION_NAME/TYPE
+            parts = connection.topic.split("/")
+            if len(parts) < 6:
+                continue  # Invalid topic format
+
+            sensor_id = parts[2]  # sensor_0, sensor_1, sensor_2
+            option_name = parts[4]  # Exposure, Gain, etc.
+            option_type = parts[5]  # value or description
+
+            # The same option name can appear on multiple sensors.
+            option_key = (sensor_id, option_name)
+            if option_key not in options_dict:
+                options_dict[option_key] = {
+                    "name": option_name,
+                    "sensor": sensor_id,
+                    "value": None,
+                    "description": None,
+                }
+
+            # Store value or description
+            if option_type == "value":
+                options_dict[option_key]["value"] = float(msg.data)
+            elif option_type == "description":
+                options_dict[option_key]["description"] = str(msg.data)
+
+        self._stats["options_cache"] = options_dict
+
+        if self.config.verbose:
+            print(f"Cached {len(options_dict)} Options")
 
     def _write_configurations(self, writer: VRSWriter) -> None:
         """Write Configuration records for each stream"""
@@ -453,143 +476,130 @@ class RosbagToVRSConverter:
     def _write_color_configuration(
         self, writer: VRSWriter, stream_config: StreamConfig, topic: str
     ) -> None:
-        """Write Color stream Configuration record"""
-        camera_info_topic = "/device_0/sensor_1/Color_0/info/camera_info"
-        camera_info = self._stats["camera_info_cache"].get(camera_info_topic)
-
-        if camera_info is None:
-            raise ValueError(f"CameraInfo not found for {camera_info_topic}")
-
-        config_data = {
-            "width": int(camera_info.width),
-            "height": int(camera_info.height),
-            "encoding": "rgb8",  # Default, will be overridden by StreamInfo
-            "camera_k": list(camera_info.K),  # 9 elements
-            "camera_d": list(camera_info.D),  # 5 elements (distortion coefficients)
-            "distortion_model": camera_info.distortion_model,
-            "frame_id": camera_info.header.frame_id,  # Store frame_id in configuration
-        }
-
-        # Add StreamInfo if available
-        stream_info_topic = "/device_0/sensor_1/Color_0/info"
-        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
-
-        if stream_info:
-            config_data["fps"] = int(stream_info.fps)
-            config_data["encoding"] = str(stream_info.encoding)  # Override with actual encoding
-            config_data["is_recommended"] = bool(stream_info.is_recommended)
-
-        writer.write_configuration(stream_config.stream_id, config_data)
-
-        if self.config.verbose:
-            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
-            resolution = f"{camera_info.width}x{camera_info.height}{fps_str}"
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Color): {resolution}")
+        self._write_image_configuration(writer, stream_config, topic)
 
     def _write_depth_configuration(
         self, writer: VRSWriter, stream_config: StreamConfig, topic: str
     ) -> None:
-        """Write Depth stream Configuration record"""
-        camera_info_topic = "/device_0/sensor_0/Depth_0/info/camera_info"
-        camera_info = self._stats["camera_info_cache"].get(camera_info_topic)
+        self._write_image_configuration(writer, stream_config, topic)
 
+    @staticmethod
+    def _camera_array(camera_info: Any, field: str) -> list[float]:
+        """Handle ROS1's upper-case and ROS2's lower-case calibration fields."""
+        values = getattr(camera_info, field, None)
+        if values is None:
+            values = getattr(camera_info, field.lower(), ())
+        if values is None:
+            return []
+        return [float(value) for value in values]
+
+    def _write_image_configuration(
+        self, writer: VRSWriter, stream_config: StreamConfig, topic: str
+    ) -> None:
+        base_topic = topic.removesuffix("/image/data")
+        camera_info_topic = f"{base_topic}/info/camera_info"
+        camera_info = self._stats["camera_info_cache"].get(camera_info_topic)
         if camera_info is None:
             raise ValueError(f"CameraInfo not found for {camera_info_topic}")
-
-        config_data = {
+        stream_info = self._stats["stream_info_cache"].get(f"{base_topic}/info")
+        is_depth = stream_config.stream_type == "depth"
+        config_data: dict[str, Any] = {
             "width": int(camera_info.width),
             "height": int(camera_info.height),
-            "encoding": "16UC1",  # Depth encoding, will be overridden by StreamInfo
-            "camera_k": list(camera_info.K),
-            "camera_d": list(camera_info.D),
-            "distortion_model": camera_info.distortion_model,
-            "depth_scale": 0.001,  # mm -> meters
-            "frame_id": camera_info.header.frame_id,  # Store frame_id in configuration
+            "encoding": "16UC1" if is_depth else "rgb8",
+            "camera_k": self._camera_array(camera_info, "K"),
+            "camera_d": self._camera_array(camera_info, "D"),
+            "camera_r": self._camera_array(camera_info, "R"),
+            "camera_p": self._camera_array(camera_info, "P"),
+            "distortion_model": str(camera_info.distortion_model),
+            "frame_id": str(camera_info.header.frame_id),
         }
-
-        # Add StreamInfo if available
-        stream_info_topic = "/device_0/sensor_0/Depth_0/info"
-        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
-
-        if stream_info:
-            config_data["fps"] = int(stream_info.fps)
-            config_data["encoding"] = str(stream_info.encoding)  # Override with actual encoding
-            config_data["is_recommended"] = bool(stream_info.is_recommended)
-
+        if stream_info is not None:
+            config_data.update(
+                fps=int(stream_info.fps),
+                encoding=str(stream_info.encoding),
+                is_recommended=bool(stream_info.is_recommended),
+            )
+        image = self._stats["sample_headers"].get(topic)
+        if image is not None:
+            description = image_description(image)
+            if (description["width"], description["height"]) != (
+                config_data["width"],
+                config_data["height"],
+            ):
+                raise ValueError(f"Image dimensions disagree with CameraInfo for {topic}")
+            config_data.update(description)
+            config_data["source_encoding"] = str(image.encoding)
+        if is_depth:
+            scale, source = self._depth_scale(topic)
+            config_data["depth_scale"] = scale
+            config_data["depth_scale_source"] = source
+        self._stats["image_configurations"][stream_config.stream_id] = config_data
         writer.write_configuration(stream_config.stream_id, config_data)
-
         if self.config.verbose:
-            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
-            resolution = f"{camera_info.width}x{camera_info.height}{fps_str}"
-            print(f"Wrote Configuration for stream {stream_config.stream_id} (Depth): {resolution}")
+            print(
+                f"Configured {stream_config.stream_type} stream {stream_config.stream_id}: "
+                f"{config_data['width']}x{config_data['height']} {config_data['encoding']}"
+            )
+
+    def _depth_scale(self, topic: str) -> tuple[float, str]:
+        """Use recorded Depth Units when available, otherwise retain the explicit default."""
+        sensor_id = topic.split("/")[2]
+        for option in self._stats["options_cache"].values():
+            name = option["name"].lower().replace(" ", "").replace("_", "")
+            if option["sensor"] == sensor_id and name == "depthunits":
+                value = option["value"]
+                if value is None:
+                    continue
+                scale = float(value)
+                if not math.isfinite(scale) or scale <= 0:
+                    raise ValueError("Recorded Depth Units must be finite and positive")
+                return scale, "recorded_depth_units"
+        return 0.001, "default_millimeters"
 
     def _write_imu_accel_configuration(
         self, writer: VRSWriter, stream_config: StreamConfig, topic: str
     ) -> None:
-        """Write IMU Accelerometer Configuration record"""
-        config_data = {
-            "sensor_type": "accelerometer",
-            "frame_id": "0",
-            "unit": "m/s^2",
-            "sample_rate": 44.0,  # Estimated from ROSbag analysis
-            "axes": ["x", "y", "z"],
-            "range": None,  # Not specified in ROSbag
-            "noise_variances": [0.0, 0.0, 0.0],  # From IMU intrinsic (all zeros)
-            "bias_variances": [0.0, 0.0, 0.0],
-        }
-
-        # Add StreamInfo if available
-        stream_info_topic = "/device_0/sensor_2/Accel_0/info"
-        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
-
-        if stream_info:
-            config_data["fps"] = int(stream_info.fps)
-            config_data["encoding"] = str(stream_info.encoding)
-            config_data["is_recommended"] = bool(stream_info.is_recommended)
-
-        writer.write_configuration(stream_config.stream_id, config_data)
-
-        if self.config.verbose:
-            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
-            sample_rate = config_data["sample_rate"]
-            print(
-                f"Wrote Configuration for stream {stream_config.stream_id} "
-                f"(Accel): {sample_rate} Hz{fps_str}"
-            )
+        self._write_imu_configuration(writer, stream_config, topic, "accelerometer", "m/s^2")
 
     def _write_imu_gyro_configuration(
         self, writer: VRSWriter, stream_config: StreamConfig, topic: str
     ) -> None:
-        """Write IMU Gyroscope Configuration record"""
-        config_data = {
-            "sensor_type": "gyroscope",
-            "frame_id": "0",
-            "unit": "rad/s",
-            "sample_rate": 55.0,  # Estimated from ROSbag analysis
+        self._write_imu_configuration(writer, stream_config, topic, "gyroscope", "rad/s")
+
+    def _write_imu_configuration(
+        self,
+        writer: VRSWriter,
+        stream_config: StreamConfig,
+        topic: str,
+        sensor_type: str,
+        unit: str,
+    ) -> None:
+        """Preserve recorded IMU settings; never invent a rate or noise calibration."""
+        message = self._stats["sample_headers"].get(topic)
+        header = getattr(message, "header", None)
+        stream_info = self._stats["stream_info_cache"].get(
+            topic.removesuffix("/imu/data") + "/info"
+        )
+        config_data: dict[str, Any] = {
+            "sensor_type": sensor_type,
+            "frame_id": str(getattr(header, "frame_id", "")),
+            "unit": unit,
+            "sample_rate": float(stream_info.fps) if stream_info is not None else None,
             "axes": ["x", "y", "z"],
-            "range": None,  # Not specified in ROSbag
-            "noise_variances": [0.0, 0.0, 0.0],  # From IMU intrinsic (all zeros)
-            "bias_variances": [0.0, 0.0, 0.0],
+            "range": None,
+            "noise_variances": None,
+            "bias_variances": None,
         }
-
-        # Add StreamInfo if available
-        stream_info_topic = "/device_0/sensor_2/Gyro_0/info"
-        stream_info = self._stats["stream_info_cache"].get(stream_info_topic)
-
-        if stream_info:
-            config_data["fps"] = int(stream_info.fps)
-            config_data["encoding"] = str(stream_info.encoding)
-            config_data["is_recommended"] = bool(stream_info.is_recommended)
-
-        writer.write_configuration(stream_config.stream_id, config_data)
-
-        if self.config.verbose:
-            fps_str = f", fps={config_data.get('fps', 'N/A')}" if "fps" in config_data else ""
-            sample_rate = config_data["sample_rate"]
-            print(
-                f"Wrote Configuration for stream {stream_config.stream_id} "
-                f"(Gyro): {sample_rate} Hz{fps_str}"
+        if stream_info is not None:
+            config_data.update(
+                fps=int(stream_info.fps),
+                encoding=str(stream_info.encoding),
+                is_recommended=bool(stream_info.is_recommended),
             )
+        writer.write_configuration(stream_config.stream_id, config_data)
+        if self.config.verbose:
+            print(f"Configured {sensor_type} stream {stream_config.stream_id}")
 
     def _write_transform_depth_configuration(
         self, writer: VRSWriter, stream_config: StreamConfig, topic: str
@@ -772,10 +782,10 @@ class RosbagToVRSConverter:
 
         # Build options array
         options_array = []
-        for name, data in sorted(options_dict.items()):
+        for _, data in sorted(options_dict.items()):
             options_array.append(
                 {
-                    "name": name,
+                    "name": data["name"],
                     "sensor": data["sensor"],
                     "value": data["value"],
                     "description": data["description"],
@@ -801,69 +811,58 @@ class RosbagToVRSConverter:
         """Process all messages in temporal order"""
         target_topics = list(self.config.topic_mapping.keys())
 
-        with reader:
-            connections = [x for x in reader.connections if x.topic in target_topics]
+        connections = [x for x in reader.connections if x.topic in target_topics]
 
-            if not connections:
-                raise ValueError(f"No messages found for topics: {target_topics}")
+        if not connections:
+            raise ValueError(f"No messages found for topics: {target_topics}")
 
-            for connection, timestamp, rawdata in reader.messages(connections=connections):
-                # Get stream config
-                stream_config = self.config.topic_mapping.get(connection.topic)
-                if stream_config is None:
-                    continue  # Skip topics not in mapping
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            # Get stream config
+            stream_config = self.config.topic_mapping.get(connection.topic)
+            if stream_config is None:
+                continue  # Skip topics not in mapping
 
-                # Deserialize message
-                msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
+            # Deserialize message
+            msg = deserialize_reader_message(reader, rawdata, connection.msgtype)
 
-                # Convert and write based on stream type
-                if stream_config.stream_type == "color":
-                    self._process_color_message(writer, stream_config, msg, timestamp)
-                elif stream_config.stream_type == "depth":
-                    self._process_depth_message(writer, stream_config, msg, timestamp)
-                elif stream_config.stream_type == "imu_accel":
-                    self._process_imu_accel_message(writer, stream_config, msg, timestamp)
-                elif stream_config.stream_type == "imu_gyro":
-                    self._process_imu_gyro_message(writer, stream_config, msg, timestamp)
+            # Convert and write based on stream type
+            if stream_config.stream_type == "color":
+                self._process_color_message(writer, stream_config, msg, timestamp)
+            elif stream_config.stream_type == "depth":
+                self._process_depth_message(writer, stream_config, msg, timestamp)
+            elif stream_config.stream_type == "imu_accel":
+                self._process_imu_accel_message(writer, stream_config, msg, timestamp)
+            elif stream_config.stream_type == "imu_gyro":
+                self._process_imu_gyro_message(writer, stream_config, msg, timestamp)
+            else:
+                continue
 
-                # Update statistics
-                self._stats["total_messages"] += 1
-                self._stats["messages_per_stream"][stream_config.stream_id] += 1
+            # Count emitted Data records, not configuration-only source messages.
+            self._stats["total_messages"] += 1
+            self._stats["messages_per_stream"][stream_config.stream_id] += 1
 
     def _process_color_message(
         self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int
     ) -> None:
-        """Process Color Image message"""
-        # Convert timestamp (nanoseconds -> seconds)
-        timestamp_sec = timestamp / 1e9
-
-        # Extract image data
-        image_data = bytes(msg.data)
-
-        # Write Data record (timestamp + Image bytes)
-        # Note: frame_id and encoding are stored in Configuration record
-        writer.write_data(stream_config.stream_id, timestamp_sec, image_data)
+        self._process_image_message(writer, stream_config, msg, timestamp)
 
     def _process_depth_message(
         self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int
     ) -> None:
-        """Process Depth Image message"""
-        # Convert timestamp (nanoseconds -> seconds)
-        timestamp_sec = timestamp / 1e9
+        self._process_image_message(writer, stream_config, msg, timestamp)
 
-        # Extract depth data
-        depth_data = bytes(msg.data)
-
-        # Write Data record (timestamp + Depth bytes)
-        # Note: frame_id and encoding are stored in Configuration record
-        writer.write_data(stream_config.stream_id, timestamp_sec, depth_data)
+    def _process_image_message(
+        self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int
+    ) -> None:
+        """Preserve image values while removing ROS row padding and big-endian storage."""
+        configuration = self._stats["image_configurations"][stream_config.stream_id]
+        payload = image_payload(msg, configuration)
+        writer.write_data(stream_config.stream_id, timestamp / 1e9, payload)
 
     def _process_imu_accel_message(
         self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int
     ) -> None:
         """Process IMU Accelerometer message"""
-        import struct
-
         # Convert timestamp (nanoseconds -> seconds)
         timestamp_sec = timestamp / 1e9
 
@@ -880,8 +879,6 @@ class RosbagToVRSConverter:
         self, writer: VRSWriter, stream_config: StreamConfig, msg: Any, timestamp: int
     ) -> None:
         """Process IMU Gyroscope message"""
-        import struct
-
         # Convert timestamp (nanoseconds -> seconds)
         timestamp_sec = timestamp / 1e9
 
@@ -895,27 +892,20 @@ class RosbagToVRSConverter:
         writer.write_data(stream_config.stream_id, timestamp_sec, imu_data)
 
     def _calculate_bag_duration(self, reader: Any) -> float:
-        """Calculate bag duration (first to last message timestamp)"""
-        min_ts = float("inf")
-        max_ts = float("-inf")
-
-        try:
-            with reader:
-                for connection, timestamp, rawdata in reader.messages():
-                    min_ts = min(min_ts, timestamp)
-                    max_ts = max(max_ts, timestamp)
-
-                    # Early exit after 1000 messages for performance
-                    # (assumes messages are somewhat evenly distributed)
-                    if max_ts - min_ts > 1e9:  # At least 1 second
-                        break
-        except Exception:
-            # If we can't read messages, return 0
+        """Return exact first-to-last message duration, not an early sample."""
+        start = getattr(reader, "start_time", None)
+        end = getattr(reader, "end_time", None)
+        if isinstance(start, int) and isinstance(end, int):
+            # rosbags uses an exclusive end timestamp (last message + 1 ns).
+            return max(0.0, (end - start - 1) / 1e9)
+        timestamps = (timestamp for _, timestamp, _ in reader.messages())
+        first = next(timestamps, None)
+        if first is None:
             return 0.0
-
-        # Convert nanoseconds -> seconds
-        duration_sec = (max_ts - min_ts) / 1e9
-        return max(0.0, duration_sec)
+        last = first
+        for last in timestamps:
+            pass
+        return float(max(0.0, (last - first) / 1e9))
 
 
 # RGB-D stream mapping (Color + Depth + Transform)

@@ -1,568 +1,147 @@
-# 実装詳細: RealSense ROSbag → VRS 変換システム
+# 実装詳細: RealSense ROSbag → VRS
 
-**RealSense D435i ROSbagのRGB-D、IMU、Transform、Device/Sensor Info、OptionsをVRSへ保存・再生するシステムの実装詳細**
+**更新日: 2026-10-30 / パッケージ版: 0.1.0 / 保存形式版: 2**
 
----
+この文書は現行の実装を説明します。2025年の設計書・作業記録は履歴資料として残しています。使用例は [VRS_API_CHEATSHEET.md](VRS_API_CHEATSHEET.md)、人工データの仕様と合格条件は [SYNTHETIC_E2E.md](SYNTHETIC_E2E.md) を参照してください。
 
-## 📋 目次
+## 1. 公式実装とプロジェクト側の責務
 
-1. [システムアーキテクチャ](#システムアーキテクチャ)
-2. [クラス構造とAPI](#クラス構造とapi)
-3. [データフロー](#データフロー)
-4. [カメラパラメータ取得と保存](#カメラパラメータ取得と保存)
-5. [実装済み機能](#実装済み機能)
-6. [未対応機能とロードマップ](#未対応機能とロードマップ)
-7. [VRS APIの使用方法](#vrs-apiの使用方法)
+| 層 | 実装 | 責務 |
+|---|---|---|
+| ROSbag 読み出し | `rosbags.highlevel.AnyReader` | 接続情報、メッセージ、時刻、型定義の読み出し |
+| 変換 | [rosbag_to_vrs_converter.py](../scripts/rosbag_to_vrs_converter.py) | トピック対応、設定取得、画像・IMU 変換、件数・時間の集計 |
+| 画像の解釈 | [image_payload.py](../scripts/image_payload.py) | 画素型、行余白、バイト順、寸法の検証 |
+| 書き込み API | [vrs_writer.py](../scripts/vrs_writer.py) | 保存規約、入力検証、書き出し時機、終了処理 |
+| VRS 書き込み本体 | 公式 `vrsbindings.Writer`／`Stream` | レコード生成、圧縮、非同期ファイル書き込み |
+| VRS 読み出し本体 | 公式 `pyvrs.SyncVRSReader` | VRS の解析、画像・数値メタデータの取得 |
+| 互換読み出し API | [vrs_reader.py](../scripts/vrs_reader.py) | 論理 ID、設定辞書、画像・IMU・旧形式のバイト列復元 |
 
----
+依存の固定版は [uv.lock](../uv.lock) の **vrs 1.2.2** です。2026年10月30日確認時点の [公式最新公開版](https://github.com/facebookresearch/pyvrs/releases/tag/v1.2.2)を使用し、未公開の `main` や未統合の変更には依存しません。
 
-## システムアーキテクチャ
+2026年7月の移行で自作 C++ ライターは削除されています。現行コードは公式パッケージのネイティブ API を直接使うため、高水準の `pyvrs.writer` の公開名不足を補うモジュール書き換えも不要です。[公式ネイティブライターの実装](https://github.com/facebookresearch/pyvrs/tree/v1.2.2/csrc/writer)に対応する呼び出しだけを行います。
 
-### 全体構成
+## 2. 変換の順序
 
-```mermaid
-graph TB
-    subgraph "Input: ROSbag"
-        RB[ROSbag File<br/>ROS1/ROS2]
-        RB_COLOR[Color Image Topic<br/>/device_0/sensor_1/Color_0/image/data]
-        RB_DEPTH[Depth Image Topic<br/>/device_0/sensor_0/Depth_0/image/data]
-        RB_COLOR_INFO[Color CameraInfo<br/>/device_0/sensor_1/Color_0/info/camera_info]
-        RB_DEPTH_INFO[Depth CameraInfo<br/>/device_0/sensor_0/Depth_0/info/camera_info]
-        RB_IMU_ACCEL[IMU Accel<br/>/device_0/sensor_2/Accel_0/imu/data]
-        RB_IMU_GYRO[IMU Gyro<br/>/device_0/sensor_2/Gyro_0/imu/data]
+`convert()` は1回のコンテキスト内で bag を開き、次の順序で処理します。設定探索とデータ変換で複数回走査しますが、bag を何度も開き直す構成にはしていません。
 
-        RB --> RB_COLOR
-        RB --> RB_DEPTH
-        RB --> RB_COLOR_INFO
-        RB --> RB_DEPTH_INFO
-        RB --> RB_IMU_ACCEL
-        RB --> RB_IMU_GYRO
-    end
+1. CameraInfo、最初の画像・IMU のヘッダー、Transform、StreamInfo、Device／Sensor 情報、Options を取得します。
+2. 画像寸法・符号化、校正、IMU の情報、深度倍率を確定します。
+3. ライターへ全ストリームと設定を登録します。
+4. bag の時刻順に画像・IMU を変換し、Data レコードを作成します。
+5. 待機中のデータを定期的に書き出します。
+6. 最終レコードまで書き出してファイルを閉じ、統計を返します。
 
-    subgraph "Processing Layer"
-        READER[AnyReader<br/>rosbags 0.11.3]
-        CONVERTER[RosbagToVRSConverter]
-        WRITER[VRSWriter]
+画像のバイト列を設定情報として保持し続ける必要はありません。変換を再実行すると、前回の件数と設定のキャッシュをリセットします。
 
-        RB_COLOR --> READER
-        RB_DEPTH --> READER
-        RB_COLOR_INFO --> READER
-        RB_DEPTH_INFO --> READER
-        RB_IMU_ACCEL --> READER
-        RB_IMU_GYRO --> READER
+`total_messages`／`messages_per_stream` は **出力した Data レコードの件数**です。Transform やデバイス情報など、設定取得だけに使用した入力メッセージは数えません。記録時間は bag の最初から最後までの時刻差を求め、最初の約1秒で走査を打ち切る旧方式は使いません。
 
-        READER --> CONVERTER
-        CONVERTER --> WRITER
-    end
-
-    subgraph "Output: VRS"
-        VRS[VRS File]
-        STREAM1001[Stream 1001<br/>Color + K matrix + D coeffs]
-        STREAM1002[Stream 1002<br/>Depth + K matrix + D coeffs + depth_scale]
-        STREAM1003[Stream 1003<br/>IMU Accelerometer]
-        STREAM1004[Stream 1004<br/>IMU Gyroscope]
-
-        WRITER --> VRS
-        VRS --> STREAM1001
-        VRS --> STREAM1002
-        VRS --> STREAM1003
-        VRS --> STREAM1004
-    end
-
-    subgraph "Verification Layer"
-        INSPECTOR[VRS Inspector<br/>inspect_vrs.py]
-        VRS_READER[VRSReader]
-
-        VRS --> VRS_READER
-        VRS_READER --> INSPECTOR
-    end
-
-```
-
----
-
-## クラス構造とAPI
-
-### クラス図
+## 3. ライターの状態と時刻
 
 ```mermaid
-classDiagram
-    class VRSWriter {
-        -_writer: pyvrs.writer.VRSWriter
-        -_filepath: Path
-        -_stream_states: dict[int, StreamState]
-        +__init__(filepath: Path, compression: str)
-        +add_stream(stream_id: int, flavor: str)
-        +write_configuration(stream_id: int, config: dict)
-        +write_data(stream_id: int, timestamp: float, data: bytes)
-        +is_open() bool
-        +close()
-        +__enter__() VRSWriter
-        +__exit__()
-    }
-
-    class VRSReader {
-        -_vrs_path: Path
-        -_reader: pyvrs.SyncVRSReader
-        -_stream_mapping: dict[int, StreamId]
-        +__init__(vrs_path: Path)
-        +get_stream_ids() list[int]
-        +get_record_count(stream_id: int) int
-        +read_configuration(stream_id: int) dict
-        +read_data_records(stream_id: int) Generator
-        +close()
-    }
-
-    class RosbagToVRSConverter {
-        +rosbag_path: Path
-        +vrs_path: Path
-        +config: ConverterConfig
-        -_stats: dict
-        +convert() ConversionResult
-        -_open_rosbag() AnyReader
-        -_create_streams(writer: VRSWriter)
-        -_cache_camera_info(reader: AnyReader)
-        -_write_configurations(writer: VRSWriter)
-        -_process_messages(reader: AnyReader, writer: VRSWriter)
-        -_convert_color_message(msg, timestamp: float) bytes
-        -_convert_depth_message(msg, timestamp: float) bytes
-    }
-
-    class ConverterConfig {
-        +phase: str
-        +topic_mapping: dict[str, StreamConfig]
-        +compression: str
-        +verbose: bool
-    }
-
-    class StreamConfig {
-        +stream_id: int
-        +stream_type: str
-        +recordable_type_id: str
-        +flavor: str
-    }
-
-    class ConversionResult {
-        +success: bool
-        +input_bag_size: int
-        +output_vrs_size: int
-        +compression_ratio: float
-        +total_messages: int
-        +messages_per_stream: dict[int, int]
-        +conversion_time_sec: float
-        +duration_sec: float
-    }
-
-    RosbagToVRSConverter --> VRSWriter : uses
-    RosbagToVRSConverter --> ConverterConfig : has
-    RosbagToVRSConverter --> ConversionResult : produces
-    ConverterConfig --> StreamConfig : contains
+stateDiagram-v2
+    [*] --> Setup
+    Setup --> Setup: ストリームと設定を登録
+    Setup --> Writing: 最初の Data
+    Setup --> Closed: 設定のみで close
+    Writing --> Writing: Data 追加と定期書き出し
+    Writing --> Closed: 最終書き出しと close
+    Setup --> Failed: 作成失敗
+    Writing --> Failed: 書き込み失敗
+    Failed --> Closed: 終了処理
+    Closed --> [*]
 ```
 
-### 主要クラスの役割
-
-| クラス名 | 役割 | ファイル |
-|---------|------|---------|
-| `VRSWriter` | VRSファイルへの書き込み（公式 PyVRS writer adapter） | `scripts/vrs_writer.py` |
-| `VRSReader` | VRSファイルからの読み込み（PyVRSラッパー） | `scripts/vrs_reader.py:20` |
-| `RosbagToVRSConverter` | ROSbag → VRS 変換ロジック | `scripts/rosbag_to_vrs_converter.py:84` |
-| `ConverterConfig` | 変換設定（ストリームマッピング、圧縮等） | `scripts/rosbag_to_vrs_converter.py:24` |
-| `StreamConfig` | VRSストリーム設定（ID、タイプ、flavor） | `scripts/rosbag_to_vrs_converter.py:24` |
-
----
+最初の Data 作成時に、公式ストリーム、タグ、Configuration レコードをすべて構築してからファイルを開始します。開始後の `add_stream()` と `write_configuration()` は拒否します。呼び出し側が元の設定辞書を後から変更しても記録内容が変わらないよう、設定登録時に JSON として複製します。
 
-## データフロー
+Data の時刻は、全ストリームを通じて非減少である必要があります。同じ時刻の RGB・深度・IMU や、書き出し境界をまたぐ同時刻レコードは許可します。負値・NaN・無限大・前の Data より古い時刻は拒否します。
 
-### 変換処理のシーケンス
+ROSbag のナノ秒時刻は `timestamp / 1e9` により秒へ変換します。相対時刻だけでなくエポック時刻も扱いますが、VRS に渡す時刻は浮動小数であるため、ナノ秒整数の完全一致を一般に保証するものではありません。最後のレコードと同じ時刻を取りこぼさないよう、公式書き出し処理へ渡す境界は次の表現可能な浮動小数値に進めます。
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant CLI as convert_to_vrs.py
-    participant Conv as RosbagToVRSConverter
-    participant Reader as AnyReader (rosbags)
-    participant Writer as VRSWriter
-    participant VRS as VRS File
-
-    User->>CLI: ./convert_to_vrs.py input.bag output.vrs
-    CLI->>Conv: RosbagToVRSConverter(bag_path, vrs_path, config)
-    CLI->>Conv: convert()
-
-    Conv->>Reader: _open_rosbag()
-    Reader-->>Conv: AnyReader instance
-
-    Conv->>Writer: VRSWriter(vrs_path)
-    Writer-->>Conv: writer instance
-
-    Conv->>Conv: _create_streams(writer)
-    Conv->>Writer: add_stream(1001, "Color")
-    Conv->>Writer: add_stream(1002, "Depth")
-
-    Conv->>Reader: _cache_camera_info(reader)
-    Reader-->>Conv: CameraInfo messages
-
-    Conv->>Conv: _write_configurations(writer)
-    Conv->>Writer: write_configuration(1001, color_config)
-    Writer->>VRS: Configuration Record (Stream 1001)
-    Conv->>Writer: write_configuration(1002, depth_config)
-    Writer->>VRS: Configuration Record (Stream 1002)
-
-    loop For each message in ROSbag
-        Conv->>Reader: messages()
-        Reader-->>Conv: (connection, timestamp, rawdata)
-        Conv->>Reader: deserialize(rawdata, msgtype)
-        Reader-->>Conv: message object
-
-        alt Color Image
-            Conv->>Conv: _convert_color_message(msg, timestamp)
-            Conv->>Writer: write_data(1001, timestamp, image_bytes)
-            Writer->>VRS: Data Record (Stream 1001)
-        else Depth Image
-            Conv->>Conv: _convert_depth_message(msg, timestamp)
-            Conv->>Writer: write_data(1002, timestamp, image_bytes)
-            Writer->>VRS: Data Record (Stream 1002)
-        end
-    end
-
-    Conv->>Writer: close()
-    Writer->>VRS: Finalize index
-
-    Conv-->>CLI: ConversionResult
-    CLI-->>User: Success + statistics
-```
-
----
-
-## カメラパラメータ取得と保存
-
-### ROSbag からのカメラパラメータ抽出
-
-#### 1. CameraInfo メッセージの構造
-
-ROSbag内の `sensor_msgs/CameraInfo` メッセージには以下の情報が含まれます：
-
-```python
-# sensor_msgs/CameraInfo
-header:
-  stamp: {sec, nanosec}
-  frame_id: str
-
-width: int          # 画像幅
-height: int         # 画像高さ
-distortion_model: str  # 歪みモデル ("plumb_bob", "Brown Conrady" など)
-
-# カメラ内部パラメータ行列 (3x3, row-major order)
-K: [fx,  0, cx,
-     0, fy, cy,
-     0,  0,  1]
-
-# 歪み係数 (5要素)
-D: [k1, k2, p1, p2, k3]
-
-# Rectification matrix (3x3)
-R: [...]
-
-# Projection matrix (3x4)
-P: [...]
-
-binning_x: int
-binning_y: int
-roi: RegionOfInterest
-```
-
-#### 2. パラメータの取得プロセス
-
-```mermaid
-flowchart TD
-    A[ROSbag Open] --> B[CameraInfo トピック検索]
-    B --> C{トピックが存在?}
-    C -->|Yes| D[最初のメッセージを読み取り]
-    C -->|No| E[エラー: CameraInfo not found]
-
-    D --> F[CameraInfo.K を取得<br/>fx, fy, cx, cy]
-    D --> G[CameraInfo.D を取得<br/>k1, k2, p1, p2, k3]
-    D --> H[CameraInfo.distortion_model を取得]
-    D --> I[width, height を取得]
-
-    F --> J[Configuration辞書を作成]
-    G --> J
-    H --> J
-    I --> J
-
-    J --> K[VRS Configuration レコードに書き込み]
-```
-
-#### 3. 実装コード（抜粋）
-
-```python
-# scripts/rosbag_to_vrs_converter.py:172
-def _cache_camera_info(self, reader: Any) -> None:
-    """CameraInfo メッセージをキャッシュ"""
-    camera_info_topics = [
-        "/device_0/sensor_1/Color_0/info/camera_info",  # Color
-        "/device_0/sensor_0/Depth_0/info/camera_info"   # Depth
-    ]
-
-    with reader:
-        connections = [x for x in reader.connections
-                      if x.topic in camera_info_topics]
-
-        for connection, timestamp, rawdata in reader.messages(connections=connections):
-            # rosbags 0.11.3 API
-            msg = reader.deserialize(rawdata, connection.msgtype)
-            self._stats["camera_info_cache"][connection.topic] = msg
-```
-
-```python
-# scripts/rosbag_to_vrs_converter.py:211
-def _write_color_configuration(self, writer: VRSWriter, ...) -> None:
-    """Color ストリームの Configuration レコードを書き込み"""
-    camera_info = self._stats["camera_info_cache"].get(camera_info_topic)
-
-    config_data = {
-        "width": int(camera_info.width),
-        "height": int(camera_info.height),
-        "encoding": "rgb8",
-        "camera_k": list(camera_info.K),  # [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        "camera_d": list(camera_info.D),  # [k1, k2, p1, p2, k3]
-        "distortion_model": camera_info.distortion_model,
-        "frame_id": camera_info.header.frame_id
-    }
-
-    writer.write_configuration(stream_id, config_data)
-```
-
-### VRS への保存形式
-
-#### Configuration レコードの構造
-
-```json
-{
-  "stream_id": 1001,
-  "record_type": "Configuration",
-  "data": {
-    "width": 640,
-    "height": 480,
-    "encoding": "rgb8",
-    "camera_k": [616.52, 0.0, 315.87, 0.0, 616.65, 244.28, 0.0, 0.0, 1.0],
-    "camera_d": [0.0, 0.0, 0.0, 0.0, 0.0],
-    "distortion_model": "Brown Conrady",
-    "frame_id": ""
-  }
-}
-```
-
----
-
-## 実装済み機能
-
-### ✅ Color Stream (Stream ID: 1001)
-
-**対応ROSbagトピック:**
-- `/device_0/sensor_1/Color_0/image/data` (sensor_msgs/Image)
-- `/device_0/sensor_1/Color_0/info/camera_info` (sensor_msgs/CameraInfo)
-
-**保存データ:**
-- RGB画像データ (bytes)
-- カメラ内部パラメータ (K matrix: 3x3)
-- 歪み係数 (D vector: 5 elements)
-- 歪みモデル (distortion_model: str)
-- 解像度 (width, height)
-
-**実装ファイル:**
-- `scripts/rosbag_to_vrs_converter.py:211` - `_write_color_configuration()`
-- `scripts/rosbag_to_vrs_converter.py:260` - `_process_color_message()`
-
-### ✅ Depth Stream (Stream ID: 1002)
-
-**対応ROSbagトピック:**
-- `/device_0/sensor_0/Depth_0/image/data` (sensor_msgs/Image)
-- `/device_0/sensor_0/Depth_0/info/camera_info` (sensor_msgs/CameraInfo)
-
-**保存データ:**
-- Depth画像データ (bytes, 16UC1)
-- カメラ内部パラメータ (K matrix: 3x3)
-- 歪み係数 (D vector: 5 elements)
-- 歪みモデル (distortion_model: str)
-- 解像度 (width, height)
-- **Depth scale** (0.001 = 1mm単位 → メートル変換)
-
-**実装ファイル:**
-- `scripts/rosbag_to_vrs_converter.py:234` - `_write_depth_configuration()`
-- `scripts/rosbag_to_vrs_converter.py:273` - `_process_depth_message()`
-
----
-
-### IMU / Transform / Device Info / Options
-
-`create_rgbd_imu_config()` は Color/Depth に加えて以下の stream を含みます。
-
-| Stream ID | 種別 | 内容 |
-|----------:|------|------|
-| 1003 | IMU Accel | `sensor_msgs/Imu.linear_acceleration` を double x3 として保存 |
-| 1004 | IMU Gyro | `sensor_msgs/Imu.angular_velocity` を double x3 として保存 |
-| 1005, 1006 | Transform | Depth/Color extrinsic configuration |
-| 2001 | Device Info | device key-value metadata |
-| 2002-2004 | Sensor Info | sensor module metadata |
-| 2005 | Options | sensor option value/description metadata |
-
-## 未対応機能とロードマップ
-
-### IR (Infrared) Stream
-
-#### 必要な構造
-
-**対応ROSbagトピック:**
-- `/device_0/sensor_0/Infrared_1/image/data` (sensor_msgs/Image)
-- `/device_0/sensor_0/Infrared_2/image/data` (sensor_msgs/Image)
-
-**Stream 定義:**
-
-```python
-STREAM_ID_IR1 = 1005
-STREAM_ID_IR2 = 1006
-
-StreamConfig(
-    stream_id=1005,
-    stream_type="ir",
-    recordable_type_id="EyeCamera",  # or ForwardCamera
-    flavor="RealSense_D435i_IR1"
-)
-```
-
-**Configuration レコード:**
-
-```json
-{
-  "width": 1280,
-  "height": 720,
-  "encoding": "mono8",
-  "camera_k": [...],
-  "camera_d": [...],
-  "distortion_model": "Brown Conrady",
-  "frame_id": "infra1_optical_frame"
-}
-```
-
-### 実装優先順位
-
-| 機能 | Phase | 優先度 | 理由 |
-|-----|-------|-------|------|
-| Color + Depth | 現行 | ✅ 完了 | 最も基本的なRGB-D機能 |
-| IMU (Accel/Gyro) | 現行 | ✅ 完了 | SLAM/VIO に必須 |
-| TF / Device / Sensor / Options | 現行 | ✅ 完了 | 再生時の周辺情報 |
-| IR (Infrared) | 今後 | 🟡 中 | ステレオマッチングに有用 |
-| per-frame Metadata | 今後 | 🟢 低 | 追加メタデータ |
-
----
-
-## VRS APIの使用方法
-
-### 公式 PyVRS writer adapter (書き込み)
-
-```python
-from scripts.vrs_writer import VRSWriter
-
-# VRSファイルを開く
-with VRSWriter("output.vrs", compression="lz4") as writer:
-    # ストリームを追加
-    writer.add_stream(1001, "RealSense_Color")
-
-    # Configuration レコードを書き込み
-    config = {
-        "width": 640,
-        "height": 480,
-        "camera_k": [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-    }
-    writer.write_configuration(1001, config)
-
-    # Data レコードを書き込み
-    timestamp = 1234567890.123
-    image_bytes = b'...'  # RGB画像データ
-    writer.write_data(1001, timestamp, image_bytes)
-```
-
-### PyVRS (読み込み)
-
-```python
-import pyvrs
-
-# VRSファイルを開く
-reader = pyvrs.SyncVRSReader("output.vrs")
-reader.open()
-
-# ストリーム一覧を取得
-streams = reader.get_streams()
-
-# Configuration レコードを読み取り
-config_records = [r for r in reader.records() if r.record_type == pyvrs.RecordType.CONFIGURATION]
-
-# Data レコードを読み取り
-for record in reader.records():
-    if record.record_type == pyvrs.RecordType.DATA:
-        # メタデータブロックを取得
-        metadata = record.metadata_blocks[0] if record.metadata_blocks else {}
-
-        # カスタムブロック（画像データなど）を取得
-        if record.image_blocks:
-            data = record.image_blocks[0].tobytes()
-        elif record.custom_blocks:
-            data = record.custom_blocks[0]
-        else:
-            data = b""
-```
-
----
-
-## 技術的な制約と注意事項
-
-### 1. rosbags API の変更
-
-- **rosbags 0.9.x以前**: `Reader.deserialize()` メソッドが存在
-- **rosbags 0.11.3**: `AnyReader.deserialize()` を使用
-- **対応**: `scripts/rosbag_to_vrs_converter.py` で `AnyReader` を使用
-
-### 2. CameraInfo 属性名の大文字化
-
-- **ROSメッセージ定義**: `K`, `D`, `R`, `P` (大文字)
-- **rosbags デシリアライズ後**: `camera_info.K`, `camera_info.D` (大文字のまま)
-- **注意**: 小文字 `k`, `d` ではアクセスできない
-
-### 3. 公式 PyVRS writer adapter の制限
-
-- **現状**: PyPI `vrs==1.2.2` の writer module は direct import 時に `RecordFormat` export 欠落で失敗するため、`scripts.vrs_writer.load_official_writer_backend()` で必要な native symbols と旧 compression alias を補正している。
-- **Recordable type**: 公式 writer は汎用 recordable writer ではなく登録済み factory のみを作成できる。本リポジトリでは `sample_with_image` factory を使い、logical stream id/config は stream tags、payload は image block に保存する compatibility encoding を採用している。
-- **影響**: `scripts.vrs_reader.VRSReader` では stream id、configuration、timestamp、payload を roundtrip できるが、外部 VRS consumer 向けの意味論的 recordable 型は未保証。
-
----
-
-## まとめ
-
-### 現在の実装状況
-
-| 機能 | ステータス | 実装場所 |
-|-----|----------|---------|
-| Color Image + K/D | ✅ 完了 | `rosbag_to_vrs_converter.py:211` |
-| Depth Image + K/D + depth_scale | ✅ 完了 | `rosbag_to_vrs_converter.py:234` |
-| ROSbag同等の情報再生 | ✅ 達成 | Configuration レコードに保存 |
-| IMU (Accel/Gyro) | ✅ 完了 | `create_rgbd_imu_config()` |
-| Transform / Device / Sensor / Options | ✅ 完了 | `create_rgbd_imu_config()` |
-| IR (Infrared) | 今後 | ロードマップあり |
-
-### pyvrs経由でのRGB-D + IMU読み込み
-
-**現状:**
-- ✅ RGB: 読み込み可能（PyVRS経由）
-- ✅ Depth: 読み込み可能（PyVRS経由）
-- ✅ IMU: 読み込み可能（PyVRS経由）
-- ✅ Transform / Device / Sensor / Options: configuration として読み込み可能
-- 未対応: IR と per-frame metadata は VRSファイルに保存されていない
-
-詳細は本ドキュメントの「未対応機能とロードマップ」セクションを参照してください。
-
----
-
-**作成日:** 2025-11-19
-**作成者:** Claude (Sonnet 4.5)
-**更新日:** 2026-07-08
-**バージョン:** 1.1.0
+### 待機データの制御
+
+| 制御対象 | 既定値・動作 |
+|---|---|
+| 待機中のペイロード | 16 MiB。次のレコードを加えると超える場合は先に書き出します |
+| 待機中の Data レコード数 | 256件で書き出します |
+| 公式ライターの背景キュー | 64 MiB 超過時は排出を待ちます |
+| 背景キューの待機 | 30秒以内に閾値以下にならなければエラーにします |
+| 単一の大きなレコード | 1件で閾値を超える場合があります。追加後に書き出します |
+| 正常終了 | 最終レコードを書き出し、公式 `close()` の結果を確認します |
+| 例外終了 | 元の例外を保持しながらネイティブライターを終了します |
+
+これらは待機データの制御値です。配列、圧縮処理、ネイティブライブラリを含めたプロセス全体のメモリ使用量の厳密な上限ではありません。公式 API の非ゼロ終了コードは例外として通知します。`close()` は冪等です。
+
+## 4. 保存形式バージョン 2
+
+本節の版番号は、このリポジトリの保存規約の版です。VRS ファイル形式、PyVRS、C++ VRS のライブラリ版とは別に管理します。定義は [vrs_schema.py](../scripts/vrs_schema.py) にあります。
+
+### タグ
+
+ファイルと各ストリームに `vrs_sandbox_schema_version="2"` を記録します。各ストリームはさらに次を保持します。
+
+| タグ | 内容 |
+|---|---|
+| `user_stream_id` | 利用者向けの論理 ID |
+| `user_stream_name` | 論理ストリーム名 |
+| `config_json` | 元のセンサー設定を含む JSON |
+| `payload_encoding` | 画像、IMU、汎用バイト列の区別 |
+
+VRS の実ストリーム ID は公式実装が採番します。`1001` などの論理番号と同じ値になることには依存しません。
+
+### 画像
+
+画像には公式 `sample_with_image` 作成処理を使用します。Configuration の `image_width`・`image_height`・`image_pixel_format` に実際の寸法と画素型を設定し、連続した NumPy 配列を画像ブロックとして渡します。`payload_encoding` は `native_image` です。
+
+| ROS 符号化 | VRS 画素形式 | 配列 |
+|---|---|---|
+| `rgb8` | `RGB8` | 高さ×幅×3、uint8 |
+| `bgr8` | `BGR8` | 高さ×幅×3、uint8 |
+| `rgba8` | `RGBA8` | 高さ×幅×4、uint8 |
+| `mono8`／`8UC1` | `GREY8` | 高さ×幅、uint8 |
+| `mono16`／`16UC1` | `GREY16` | 高さ×幅、uint16 |
+| `32FC1` | `DEPTH32F` | 高さ×幅、float32 |
+
+変換時には ROS Image の `step` で各行を解釈し、余白を除きます。多バイト画素の `is_bigendian` を反映し、ライターに渡すバイト列をリトルエンディアンにそろえます。画像データ長・寸法・符号化と CameraInfo の整合性を検証します。
+
+校正は `camera_k`・`camera_d`・`camera_r`・`camera_p`、歪みモデル、frame_id として `config_json` に保存します。ROS1 の大文字属性と ROS2 の小文字属性を読み取る補助処理があります。
+
+深度倍率は対象センサーの Depth Units を使用します。設定名の空白とアンダースコアの差を吸収し、同じ設定名が別センサーにあっても混同しません。記録がなければ `0.001` を採用し、`depth_scale_source="default_millimeters"` と明示します。記録値を使用した場合は `recorded_depth_units` です。
+
+### IMU
+
+公式 `sample` 作成処理を使用し、`doubles` 数値メタデータに x・y・z を保存します。`payload_encoding` は `imu_xyz_f64le` です。IMU を画像ブロックに格納しません。
+
+既存の変換器向け API は24バイトのリトルエンディアン double 3個を受け取り、公式 API に渡す前に数値へ展開します。リポジトリのリーダーは同じ24バイト形式に復元します。設定にはセンサー種別、単位、frame_id、記録された fps／sample_rate を保持します。取得頻度やノイズ校正が不明な場合は `null` とし、推測値を作りません。
+
+### その他のバイト列と設定のみのストリーム
+
+未定義のバイト列には公式 `sample` と `some_string` を使い、Base64 として格納します。`payload_encoding="opaque_base64"` により明示し、リーダーで検証付き復号を行います。
+
+Transform・Device・Sensor・Options などは `config_json` と Configuration レコードだけで保存できます。空の画像や空の Data レコードを作る必要はありません。
+
+## 5. 読み出しと過去形式への対応
+
+`VRSReader` は公式 `SyncVRSReader` を使い、`ImageConversion.OFF` により表示向けの深度正規化を無効にします。現行形式はバージョンと `payload_encoding` で解釈します。未知の保存形式バージョンや符号化を黙って読み替えることはせず、エラーにします。
+
+保存形式バージョンのない旧ファイルについては、次の読み出し経路を維持します。
+
+- `user_stream_id` タグ、または旧 `flavor` 内の `|id:` からの論理 ID 復元
+- タグ、または旧 Configuration のメタデータにある `config_json`
+- 旧 C++ ライターの CUSTOM ブロック
+- 旧 PyVRS アダプターの1行 GREY8 画像と `payload_len`
+
+旧 GREY8 形式はテスト中に公式 API で再生成して読み戻します。CUSTOM の互換処理を維持していることは、任意の過去の収録ファイルを実測で検証したことを意味しません。
+
+## 6. 検証範囲と残る制約
+
+[tests/test_synthetic_e2e.py](../tests/test_synthetic_e2e.py) は、本物の ROS1 bag と VRS を使います。画像を含む入力 bag を独立に読み取り、出力は公式 PyVRS リーダーで直接検証します。詳細な比較項目と再現手順は [SYNTHETIC_E2E.md](SYNTHETIC_E2E.md) に記載しています。
+
+[tests/test_converter_synthetic.py](../tests/test_converter_synthetic.py) の代替リーダー／ライターを使うテストは、変換の分岐を検証する別の層として残しています。これらだけをもって実 VRS 変換に成功したとは扱いません。
+
+現在の制約は次のとおりです。
+
+- 公式の公開サンプル作成処理は `UnitTest1` 記録型です。画像型や数値型が正しくても、Aria 固有の記録型への適合は保証しません。
+- ROS1 の人工 RealSense 型 bag を検証しています。任意のトピック配置、全 ROS2 記録、実機の全収録条件は対象外です。
+- 赤外線画像、フレームごとの追加メタデータ、IMU の姿勢・共分散などをすべて保存する実装ではありません。
+- 校正や設定はストリームの固定情報として保持します。記録途中の校正・画像寸法・符号化変更への対応は保証しません。
+- 実収録の bag は取得・アップロードしません。外部の bag を使う検証は、利用者が `REALSENSE_ROSBAG_PATH` で明示した場合に限ります。

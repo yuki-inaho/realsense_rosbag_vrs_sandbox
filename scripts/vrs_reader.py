@@ -6,10 +6,23 @@ which reads VRS (Virtual Reality Stream) files created by Meta.
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
+
+from scripts.vrs_schema import (
+    IMU_VECTOR,
+    IMU_VECTOR_FIELD,
+    NATIVE_IMAGE,
+    OPAQUE_BYTES,
+    OPAQUE_BYTES_FIELD,
+    PAYLOAD_ENCODING_TAG,
+    SCHEMA_VERSION,
+    SCHEMA_VERSION_TAG,
+)
 
 try:
     import pyvrs
@@ -57,6 +70,8 @@ class VRSReader:
 
         try:
             self._reader = pyvrs.SyncVRSReader(str(filepath))
+            # Keep the original RGB/depth values; PyVRS can otherwise normalize images.
+            self._reader.set_image_conversion(pyvrs.ImageConversion.OFF)
             # Cache stream ID mapping at initialization (no iteration required)
             for vrs_stream_id in self._reader.stream_ids:
                 info = self._reader.get_stream_info(vrs_stream_id)
@@ -249,40 +264,56 @@ class VRSReader:
             for record in self._reader:
                 # Note: record.record_type is a string, not enum
                 if record.stream_id == vrs_stream_id and record.record_type == "data":
-                    # Get data from custom_blocks (CUSTOM block)
-                    data = b""
-                    if record.n_custom_blocks > 0:
-                        # custom_blocks[0] contains the raw data
-                        custom_block = record.custom_blocks[0]
-                        if isinstance(custom_block, bytes):
-                            data = custom_block
-                        elif hasattr(custom_block, "data"):
-                            data = custom_block.data
-                        # Otherwise, data remains empty bytes
-                    elif getattr(record, "n_image_blocks", 0) > 0:
-                        image_block = record.image_blocks[0]
-                        if hasattr(image_block, "tobytes"):
-                            data = image_block.tobytes()
-                        elif hasattr(image_block, "data"):
-                            data = bytes(image_block.data)
-
-                        if record.n_metadata_blocks > 0:
-                            payload_len = (
-                                record.metadata_blocks[0]
-                                .get("some_string_int_map", {})
-                                .get("payload_len")
-                            )
-                            if isinstance(payload_len, int):
-                                data = data[:payload_len]
-
                     yield {
                         "timestamp": record.timestamp,
-                        "data": data,
+                        "data": self._record_payload(record, self._stream_tags(vrs_stream_id)),
                     }
         except ValueError:
             raise
         except Exception as e:
             raise RuntimeError(f"Failed to read data records for stream {stream_id}: {e}") from e
+
+    @staticmethod
+    def _record_payload(record: Any, tags: dict[str, str]) -> bytes:
+        """Decode versioned sensor records and historical byte-oriented files."""
+        metadata = record.metadata_blocks[0] if record.n_metadata_blocks else {}
+        schema_version = tags.get(SCHEMA_VERSION_TAG)
+        if schema_version is not None:
+            if schema_version != SCHEMA_VERSION:
+                raise ValueError(f"Unsupported VRS sandbox schema version: {schema_version}")
+            encoding = tags.get(PAYLOAD_ENCODING_TAG)
+            if encoding == IMU_VECTOR:
+                values = metadata.get(IMU_VECTOR_FIELD, ())
+                if len(values) != 3:
+                    raise ValueError("An IMU record must contain exactly three components")
+                return struct.pack("<ddd", *values)
+            if encoding == OPAQUE_BYTES:
+                return base64.b64decode(metadata[OPAQUE_BYTES_FIELD], validate=True)
+            if encoding != NATIVE_IMAGE:
+                raise ValueError(f"Unknown VRS payload encoding: {encoding}")
+            if record.n_image_blocks != 1:
+                raise ValueError("A native image record must contain exactly one image block")
+            return cast(bytes, record.image_blocks[0].tobytes())
+
+        # Before schema v2, C++ writers used CUSTOM blocks and the first PyVRS
+        # adapter stored opaque bytes in a one-row GREY8 image. Keep both readable.
+        if record.n_custom_blocks:
+            block = record.custom_blocks[0]
+            if isinstance(block, bytes):
+                return block
+            if hasattr(block, "tobytes"):
+                return cast(bytes, block.tobytes())
+            if hasattr(block, "data"):
+                return bytes(block.data)
+            return bytes(block)
+        if getattr(record, "n_image_blocks", 0):
+            block = record.image_blocks[0]
+            data = block.tobytes() if hasattr(block, "tobytes") else bytes(block.data)
+            payload_len = metadata.get("some_string_int_map", {}).get("payload_len")
+            if isinstance(payload_len, int):
+                data = data[:payload_len]
+            return cast(bytes, data)
+        return b""
 
     def get_record_count(self, stream_id: int) -> int:
         """Get the number of data records for the specified stream.
